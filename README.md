@@ -135,6 +135,7 @@ The full list, with comments, is in [`.env.example`](.env.example).
 | everything not listed below | [AGPL-3.0-only](LICENSE) or [commercial](COMMERCIAL_LICENSE.md) |
 | `ee/` | [Proprietary, Enterprise subscription](ee/COMMERCIAL_LICENSE.md) |
 | `clients/python/langchain-agentic-iam/` | [Apache-2.0](clients/python/langchain-agentic-iam/LICENSE) |
+| `clients/python/crewai-agentic-iam/` | [Apache-2.0](clients/python/crewai-agentic-iam/LICENSE) |
 
 Copyright (c) 2026 Tushar Kumar.
 

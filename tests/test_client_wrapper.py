@@ -1,4 +1,4 @@
-"""End-to-end: the LangChain client wrapper against the real proxy app over HTTP."""
+"""End-to-end: the client SDK wrappers against the real proxy app over HTTP."""
 from __future__ import annotations
 
 import hashlib
@@ -21,8 +21,13 @@ from app.services.vault_service import get_vault_service
 from tests.test_policy_service import FakePolicyTable
 from tests.test_proxy import FakeSupabase, FakeVault, STRIPE_KEY, TENANT, TOKEN
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "clients" / "python" / "langchain-agentic-iam"))
-from langchain_agentic_iam import SecureAPIWrapper  # noqa: E402
+_CLIENTS = Path(__file__).resolve().parents[1] / "clients" / "python"
+sys.path.insert(0, str(_CLIENTS / "langchain-agentic-iam"))
+sys.path.insert(0, str(_CLIENTS / "crewai-agentic-iam"))
+from crewai_agentic_iam.wrapper import SecureAPIWrapper as CrewAIWrapper  # noqa: E402
+from langchain_agentic_iam import SecureAPIWrapper as LangChainWrapper  # noqa: E402
+
+WRAPPERS = pytest.mark.parametrize("SecureAPIWrapper", [LangChainWrapper, CrewAIWrapper], ids=["langchain", "crewai"])
 
 
 @pytest.fixture
@@ -65,7 +70,8 @@ def live_proxy(monkeypatch):
     thread.join(5)
 
 
-def test_wrapper_through_real_proxy(live_proxy):
+@WRAPPERS
+def test_wrapper_through_real_proxy(live_proxy, SecureAPIWrapper):
     base, sent = live_proxy
     wrapper = SecureAPIWrapper(proxy_base_url=base, agent_token=TOKEN)
 
@@ -80,7 +86,8 @@ def test_wrapper_through_real_proxy(live_proxy):
     assert "x-target-url" not in req.headers
 
 
-def test_wrapper_surfaces_proxy_denials(live_proxy):
+@WRAPPERS
+def test_wrapper_surfaces_proxy_denials(live_proxy, SecureAPIWrapper):
     base, sent = live_proxy
     wrapper = SecureAPIWrapper(proxy_base_url=base, agent_token=TOKEN)
     assert "Egress denied" in wrapper.get("https://unknown.example/v1/x")
