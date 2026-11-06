@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-agentic-iam"
+version = "0.1.0"
+description = "Route LangChain agent HTTP calls through Agentic IAM Proxy: no raw API keys, human approval for risky actions."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Tushar Kumar" }]
+keywords = ["langchain", "ai-agents", "security", "iam", "proxy", "human-in-the-loop"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+dependencies = [
+    "requests>=2.31",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/tusharfc/agentic-iam-proxy"
+Source = "https://github.com/tusharfc/agentic-iam-proxy/tree/main/clients/python/langchain-agentic-iam"
+
+[tool.hatch.build.targets.sdist]
+include = ["langchain_agentic_iam", "tests", "examples", "README.md", "LICENSE"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_agentic_iam"]

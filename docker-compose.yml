@@ -1,0 +1,27 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  proxy:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file: .env
+    environment:
+      # Values come from .env (see .env.example).
+      SUPABASE_URL: ${SUPABASE_URL:?set SUPABASE_URL in .env}
+      # Service-role key, not the anon key: the proxy needs to bypass RLS for its own lookups.
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?set SUPABASE_SERVICE_ROLE_KEY in .env}
+      VAULT_ENCRYPTION_KEY: ${VAULT_ENCRYPTION_KEY:?set VAULT_ENCRYPTION_KEY in .env}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped

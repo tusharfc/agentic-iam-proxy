@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+fakeredis>=2.20
+requests>=2.31
