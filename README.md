@@ -16,7 +16,7 @@ sequenceDiagram
     Proxy->>Proxy: Verify agent token & host allowlist
     Proxy->>Vault: Fetch encrypted Stripe key
     Vault-->>Proxy: Ciphertext (decrypted in the proxy)
-    Proxy->>Proxy: Detect High Risk (URL contains 'refund')
+    Proxy->>Proxy: Evaluate tenant policies (refunds → requires_approval)
     Proxy->>Slack: Pause Request & Send Approval Message
     Slack-->>Proxy: Human Clicks "Approve" (signed callback)
     Proxy->>API: Forward Request (Real API Key)
@@ -72,6 +72,7 @@ curl -s localhost:8000/api/v1/proxy/v1/customers \
   -H "Authorization: Bearer $AGENT" -H "X-Target-Url: https://api.stripe.com"
 
 # High-risk call: pauses until someone clicks Approve or Deny in Slack
+# (needs a requires_approval policy, see "Policies" below)
 curl -s -X POST localhost:8000/api/v1/proxy/v1/refunds \
   -H "Authorization: Bearer $AGENT" -H "X-Target-Url: https://api.stripe.com" \
   -d charge=ch_123
@@ -83,11 +84,27 @@ Point your agent framework's HTTP client at `http://localhost:8000/api/v1/proxy/
 
 1. **Agent Token.** The agent sends its request to the proxy with its own token (`Authorization: Bearer ...`) and the real destination in `X-Target-Url`. The proxy looks up the SHA-256 hash of the token to find the tenant. Only hashes are stored.
 2. **Egress check.** The destination host must be on the approved service allowlist (`api.stripe.com`, `api.github.com`, `api.openai.com`, `slack.com`), over HTTPS. Anything else gets `403`. Destinations that resolve to private or internal addresses are always blocked.
-3. **Vault lookup.** The tenant's key for that service is fetched and decrypted (Fernet, `VAULT_ENCRYPTION_KEY`). If there is no key, the request fails right away, before any human is asked.
-4. **Redis Pause.** High-risk requests (currently: URLs containing `refund` or `delete`) post an Approve/Deny message to Slack and wait on a Redis channel. The agent's request stays open. A signed Slack callback wakes it. Denied or timed-out requests (`HITL_TIMEOUT_SECONDS`, default 300) get `403` and are never executed.
-5. **Vault Swap.** The agent's token is stripped and the real key is injected as `Authorization: Bearer <key>`. The request is forwarded and the response streams back to the agent.
+3. **Policy check.** The tenant's rules in `tenant_policies` are evaluated in priority order (see [Policies](#policies)). `deny` returns `403` immediately.
+4. **Vault lookup.** The tenant's key for that service is fetched and decrypted (Fernet, `VAULT_ENCRYPTION_KEY`). If there is no key, the request fails right away, before any human is asked.
+5. **Redis Pause.** Requests whose policy is `requires_approval` post an Approve/Deny message to Slack and wait on a Redis channel. The agent's request stays open. A signed Slack callback wakes it. Denied or timed-out requests (`HITL_TIMEOUT_SECONDS`, default 300) get `403` and are never executed.
+6. **Vault Swap.** The agent's token is stripped and the real key is injected as `Authorization: Bearer <key>`. The request is forwarded and the response streams back to the agent.
 
 Decrypted keys are never logged, returned, or written to audit logs.
+
+### Policies
+
+Each row in `tenant_policies` has a `priority` (lowest first), a `method` (`GET`, `POST`, ... or `*`), a `url_pattern` regex, and an `action`: `allow`, `deny` or `requires_approval`. The first matching rule decides. If nothing matches, the request is allowed.
+
+```sql
+insert into tenant_policies (tenant_id, name, priority, method, url_pattern, action) values
+  ('<tenant-id>', 'Block customer deletion',          10, 'DELETE', '^https://api\.stripe\.com/v1/customers/', 'deny'),
+  ('<tenant-id>', 'Require approval for refunds',     20, 'POST',   '^https://api\.stripe\.com/v1/refunds',    'requires_approval'),
+  ('<tenant-id>', 'Require approval for any delete', 100, 'DELETE', '.*',                                         'requires_approval');
+```
+
+- **What is matched:** patterns are matched against `scheme://host/path`, without the query string, so an agent can't add `?x=...` to trigger or dodge a rule. Encoded characters (`%66` → `f`) and `..` are resolved first, so `/v1/re%66unds` still matches `refunds`. Anchor patterns with `^` for exact control.
+- **Fails closed:** an invalid pattern, or one that takes too long to match, denies the request. If policies can't be loaded, the agent gets `503`.
+- **Tie-breaking:** at equal priority, the stricter action wins (`deny` > `requires_approval` > `allow`).
 
 ### Slack setup
 

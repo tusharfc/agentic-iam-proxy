@@ -15,8 +15,10 @@ from fastapi import FastAPI
 
 from app.api import proxy
 from app.core.config import Settings, get_settings
+from app.services.policy_service import PolicyService, get_policy_service
 from app.services.supabase_client import get_supabase
 from app.services.vault_service import get_vault_service
+from tests.test_policy_service import FakePolicyTable
 from tests.test_proxy import FakeSupabase, FakeVault, STRIPE_KEY, TENANT, TOKEN
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "clients" / "python" / "langchain-agentic-iam"))
@@ -47,6 +49,7 @@ def live_proxy(monkeypatch):
     app.dependency_overrides[get_supabase] = lambda: supabase
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_vault_service] = lambda: FakeVault()
+    app.dependency_overrides[get_policy_service] = lambda: PolicyService(FakePolicyTable([]))
     app.dependency_overrides[proxy.get_http_client] = lambda: httpx.AsyncClient(transport=httpx.MockTransport(downstream))
 
     with socket.socket() as s:

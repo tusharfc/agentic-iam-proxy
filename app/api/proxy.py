@@ -21,6 +21,7 @@ from supabase import AsyncClient
 from app.core.config import Settings, get_settings
 from app.core.security import tenant_for_token
 from app.services import redis_pubsub, slack_service
+from app.services.policy_service import DENY, REQUIRES_APPROVAL, PolicyService, get_policy_service
 from app.services.supabase_client import get_supabase
 from app.services.vault_service import VaultError, VaultService, get_vault_service
 
@@ -187,12 +188,6 @@ def _filter_headers(raw: List[Tuple[bytes, bytes]], excluded: frozenset) -> List
     return [(k.lower(), v) for k, v in raw if k.decode("latin-1").lower() not in drop]
 
 
-def _requires_approval(target: httpx.URL) -> bool:
-    # Mock policy until per-tenant policies are loaded from Supabase.
-    url = str(target).lower()
-    return "refund" in url or "delete" in url
-
-
 def service_for(target: httpx.URL) -> Optional[str]:
     return SERVICE_HOSTS.get(target.host.lower().rstrip("."))
 
@@ -205,6 +200,7 @@ async def proxy(
     supabase: AsyncClient = Depends(get_supabase),
     client: httpx.AsyncClient = Depends(get_http_client),
     vault: VaultService = Depends(get_vault_service),
+    policies: PolicyService = Depends(get_policy_service),
 ):
     tenant_id = await _authenticate(request, supabase)
     method = request.method
@@ -225,6 +221,15 @@ async def proxy(
     if target.scheme != "https":
         await record_audit(tenant_id, audit_url, method, 400)
         raise HTTPException(400, f"{service_name} credentials are only sent over https")
+    try:
+        action = await policies.evaluate_request(tenant_id, method, str(target))
+    except Exception:
+        log.exception("Policy evaluation failed for tenant %s", tenant_id)
+        await record_audit(tenant_id, audit_url, method, 503)
+        raise HTTPException(503, "policy service unavailable")
+    if action == DENY:
+        await record_audit(tenant_id, audit_url, method, 403)
+        raise HTTPException(403, "Action denied by tenant security policy")
     # Before any approval request: never ask a human to approve a call that can't be authenticated.
     try:
         api_key = await vault.get_decrypted_key(tenant_id, service_name)
@@ -237,7 +242,7 @@ async def proxy(
     # Bearer suits every service in SERVICE_HOSTS; some APIs (e.g. Anthropic) expect `x-api-key` instead.
     headers.append((b"authorization", f"Bearer {api_key}".encode()))
 
-    if _requires_approval(target):
+    if action == REQUIRES_APPROVAL:
         request_id = str(uuid.uuid4())
         try:
             await slack_service.send_approval_message(request_id, str(target), tenant_id, settings=settings)

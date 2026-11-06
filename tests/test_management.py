@@ -12,7 +12,9 @@ from fastapi.testclient import TestClient
 from app.api import proxy
 from app.api.management import router as management_router
 from app.core.config import Settings, get_settings
+from app.services.policy_service import PolicyService, get_policy_service
 from app.services.supabase_client import get_supabase
+from tests.test_policy_service import FakePolicyTable
 
 TENANT = "5f0c7c1e-2b55-4c2a-9a59-6d3f4b0f1a11"
 OTHER_TENANT = "9d1b2c3e-4f50-4a61-8b72-c3d4e5f60718"
@@ -86,6 +88,7 @@ def setup(monkeypatch):
     app.include_router(proxy.router)
     app.dependency_overrides[get_supabase] = lambda: supabase
     app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_policy_service] = lambda: PolicyService(FakePolicyTable([]))
     monkeypatch.setattr(proxy, "_http_client", None)
     return app, TestClient(app), supabase, settings
 

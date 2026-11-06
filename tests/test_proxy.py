@@ -16,7 +16,9 @@ from app.api.callbacks import router as callbacks_router
 from app.core.config import Settings, get_settings
 from app.services import redis_pubsub
 from app.services.supabase_client import get_supabase
+from app.services.policy_service import PolicyService, get_policy_service
 from app.services.vault_service import VaultError, get_vault_service
+from tests.test_policy_service import FakePolicyTable, rule
 
 TOKEN = "agent-secret-token"
 TENANT = "5f0c7c1e-2b55-4c2a-9a59-6d3f4b0f1a11"
@@ -92,7 +94,7 @@ def reset_proxy_state(monkeypatch):
     proxy._audit_logger.cache_clear()
 
 
-def make_app(downstream=None, vault=None, **settings_overrides):
+def make_app(downstream=None, vault=None, policies=None, **settings_overrides):
     supabase = FakeSupabase({hashlib.sha256(TOKEN.encode()).hexdigest(): [{"tenant_id": TENANT}]})
     settings = Settings(_env_file=None, **settings_overrides)
     app = FastAPI()
@@ -102,6 +104,9 @@ def make_app(downstream=None, vault=None, **settings_overrides):
     app.dependency_overrides[get_settings] = lambda: settings
     vault = FakeVault() if vault is None else vault
     app.dependency_overrides[get_vault_service] = lambda: vault
+    # Default tenant rule mirrors the old hardcoded check: refunds and deletes need approval.
+    rules = [rule("(?i)refund|delete", "requires_approval")] if policies is None else policies
+    app.dependency_overrides[get_policy_service] = lambda: PolicyService(FakePolicyTable(rules))
     if downstream is not None:
         app.dependency_overrides[proxy.get_http_client] = lambda: httpx.AsyncClient(
             transport=httpx.MockTransport(downstream)
@@ -109,8 +114,8 @@ def make_app(downstream=None, vault=None, **settings_overrides):
     return app, supabase
 
 
-def make_client(downstream=None, vault=None, **settings_overrides):
-    app, supabase = make_app(downstream, vault, **settings_overrides)
+def make_client(downstream=None, vault=None, policies=None, **settings_overrides):
+    app, supabase = make_app(downstream, vault, policies, **settings_overrides)
     return TestClient(app), supabase
 
 
@@ -384,7 +389,7 @@ def decision(monkeypatch):
 @pytest.mark.parametrize("target", [
     "https://api.stripe.com/v1/refunds",
     "https://a.example/users/7/delete",
-    "https://a.example/x?action=DELETE",
+    "https://a.example/x/DELETE",
 ])
 def test_high_risk_asks_slack_then_waits_then_forwards(decision, target):
     downstream = Downstream()
@@ -604,3 +609,64 @@ def test_decrypted_key_never_logged_or_audited(ee_audit, caplog, capsys):
     assert len(audit.calls) == 2
     for text in (caplog.text, captured.out, captured.err, repr(audit.calls)):
         assert STRIPE_KEY not in text
+
+
+# Policy engine
+
+def test_policy_deny_is_403_before_vault_and_slack(decision):
+    downstream, vault = Downstream(), FakeVault()
+    client, _ = make_client(downstream, vault, policies=[rule(r"/v1/refunds", "deny")])
+    resp = client.post("/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"})
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Action denied by tenant security policy"}
+    assert vault.lookups == []
+    assert decision["events"] == []
+    assert downstream.requests == []
+
+
+def test_policy_allow_skips_approval(decision):
+    downstream = Downstream()
+    client, _ = make_client(downstream, policies=[rule(r"/v1/refunds", "allow")])
+    resp = client.post("/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"})
+    assert resp.status_code == 200
+    assert decision["events"] == []
+    assert len(downstream.requests) == 1
+
+
+def test_no_policies_means_allow(decision):
+    downstream = Downstream()
+    client, _ = make_client(downstream, policies=[])
+    assert client.delete("/api/v1/proxy/v1/refunds/re_1", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"}).status_code == 200
+    assert decision["events"] == []
+
+
+def test_policy_method_scoping(decision):
+    policies = [rule(r"/v1/customers", "deny", method="DELETE")]
+    client, _ = make_client(Downstream(), policies=policies)
+    target = {**AUTH, "X-Target-Url": "https://api.stripe.com"}
+    assert client.get("/api/v1/proxy/v1/customers/cus_1", headers=target).status_code == 200
+    assert client.delete("/api/v1/proxy/v1/customers/cus_1", headers=target).status_code == 403
+
+
+def test_encoded_path_cannot_dodge_policy(decision):
+    downstream = Downstream()
+    client, _ = make_client(downstream, policies=[rule(r"^https://api\.stripe\.com/v1/refunds$", "deny")])
+    resp = client.post("/api/v1/proxy/v1/re%66unds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"})
+    assert resp.status_code == 403
+    assert downstream.requests == []
+
+
+def test_policy_backend_failure_fails_closed(decision, ee_audit):
+    import ee.api.audit as audit
+
+    class Broken:
+        async def evaluate_request(self, *args):
+            raise RuntimeError("supabase down")
+
+    downstream = Downstream()
+    app, _ = make_app(downstream)
+    app.dependency_overrides[get_policy_service] = lambda: Broken()
+    resp = TestClient(app).post("/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"})
+    assert resp.status_code == 503
+    assert downstream.requests == []
+    assert audit.calls == [(TENANT, "https://api.stripe.com/v1/refunds", "POST", 503)]
