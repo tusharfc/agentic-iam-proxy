@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # Local development only: accept unsigned callbacks when no signing secret is set.
     slack_allow_unsigned_callbacks: bool = False
 
+    # Headless approvals: signed JSON webhook to your own backend/dashboard.
+    custom_webhook_url: Optional[SecretStr] = None
+    custom_webhook_secret: Optional[SecretStr] = None
+
     # Fernet key (url-safe base64, 32 bytes) encrypting tenant_api_keys.encrypted_api_key.
     vault_encryption_key: Optional[SecretStr] = None
 

@@ -112,6 +112,35 @@ insert into tenant_policies (tenant_id, name, priority, method, url_pattern, act
 2. Enable **Interactivity** with Request URL `https://<public-host>/api/v1/callbacks/slack`. For local testing, expose port 8000 with a tunnel such as `ngrok http 8000`.
 3. Copy **Basic Information > Signing Secret** into `SLACK_SIGNING_SECRET`. Unsigned callbacks are rejected.
 
+### Headless approvals (your own dashboard)
+
+Set `CUSTOM_WEBHOOK_URL` and `CUSTOM_WEBHOOK_SECRET` to receive approval requests in your own backend instead of, or alongside, Slack. When a request needs approval, the proxy POSTs:
+
+```json
+{"approval_token": "...", "action": "requires_approval", "target_url": "https://api.stripe.com/v1/refunds",
+ "method": "POST", "tenant_id": "...", "expires_at": 1762430400}
+```
+
+The body is signed Stripe-style: `X-Signature: t=<unix time>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`. Verify it before trusting the payload:
+
+```python
+parts = dict(p.split("=", 1) for p in request.headers["X-Signature"].split(","))
+expected = hmac.new(SECRET.encode(), f"{parts['t']}.".encode() + raw_body, hashlib.sha256).hexdigest()
+assert hmac.compare_digest(expected, parts["v1"]) and abs(time.time() - int(parts["t"])) < 300
+```
+
+Then record the human's decision from your dashboard's backend, authenticated with a management token from the same tenant:
+
+```bash
+curl -X POST localhost:8000/api/v1/callbacks/approve \
+  -H "X-Management-Token: $ADMIN" -H "Content-Type: application/json" -d '{"approval_token": "..."}'
+# or /api/v1/callbacks/deny  ->  {"status": "success", "action": "approved"}
+```
+
+- **Two credentials, both required.** The approval token is random, single-use, expires with the request, and the proxy stores only its hash. The management token must belong to the tenant that owns the request, so another tenant can neither use nor burn your tokens. Keep both server-side.
+- **Errors:** a missing or invalid management token returns `401`; an unknown, used, expired or other-tenant approval token returns `404`; a request that was already decided (for example in Slack) or timed out returns `409`.
+- **Delivery failures:** if the webhook can't be delivered and no other channel succeeded, the agent gets `503` immediately instead of waiting for a timeout.
+
 ### Configuration
 
 | Variable | Purpose |
@@ -119,6 +148,7 @@ insert into tenant_policies (tenant_id, name, priority, method, url_pattern, act
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Database. Use the service-role key (server-side only), not the anon key. |
 | `VAULT_ENCRYPTION_KEY` | Encrypts stored API keys. If you lose it, every stored key becomes unreadable. |
 | `SLACK_WEBHOOK_URL`, `SLACK_SIGNING_SECRET` | Approval messages and signed button callbacks. |
+| `CUSTOM_WEBHOOK_URL`, `CUSTOM_WEBHOOK_SECRET` | Signed headless approval webhooks for your own dashboard (https). |
 | `HITL_TIMEOUT_SECONDS` | How long a high-risk request waits for a decision. Your agent's HTTP timeout must be longer. |
 
 The full list, with comments, is in [`.env.example`](.env.example).

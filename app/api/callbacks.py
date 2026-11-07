@@ -12,8 +12,10 @@ from urllib.parse import parse_qs
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from redis.exceptions import RedisError
 
+from app.api.management import get_current_tenant
 from app.api.webhooks import read_limited_body
 from app.core.config import Settings, get_settings
 from app.services import redis_pubsub, slack_service
@@ -106,3 +108,31 @@ async def slack_callback(
     if response_url is not None:
         background.add_task(slack_service.resolve_message, response_url, _outcome_text(decision, recorded, user))
     return {"ok": True, "recorded": recorded}
+
+
+class ApprovalDecisionRequest(BaseModel):
+    approval_token: str = Field(min_length=16, max_length=256)
+
+
+async def _decide_by_token(body: ApprovalDecisionRequest, decision: str, tenant_id: str) -> dict:
+    try:
+        recorded = await redis_pubsub.publish_decision_by_token(body.approval_token, decision, tenant_id)
+    except RedisError:
+        log.exception("Could not publish a headless %s decision", decision)
+        raise HTTPException(503, "approval service unavailable")
+    if recorded is None:
+        raise HTTPException(404, "approval token is invalid, already used or expired")
+    if not recorded:
+        raise HTTPException(409, "request is no longer pending (already decided or timed out)")
+    log.info("Request %s via headless callback by tenant %s", decision, tenant_id)
+    return {"status": "success", "action": decision}
+
+
+@router.post("/approve")
+async def approve(body: ApprovalDecisionRequest, tenant_id: str = Depends(get_current_tenant)) -> dict:
+    return await _decide_by_token(body, redis_pubsub.APPROVED, tenant_id)
+
+
+@router.post("/deny")
+async def deny(body: ApprovalDecisionRequest, tenant_id: str = Depends(get_current_tenant)) -> dict:
+    return await _decide_by_token(body, redis_pubsub.DENIED, tenant_id)

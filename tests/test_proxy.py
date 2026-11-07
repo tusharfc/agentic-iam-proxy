@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from app.api import proxy
 from app.api.callbacks import router as callbacks_router
+from app.api.management import get_current_tenant
 from app.core.config import Settings, get_settings
 from app.services import redis_pubsub
 from app.services.supabase_client import get_supabase
@@ -366,23 +367,38 @@ def test_unauthenticated_requests_are_not_audited(ee_audit):
 
 @pytest.fixture
 def decision(monkeypatch):
-    state = {"value": "approved", "waited": [], "events": [], "slack_error": None}
+    state = {"value": "approved", "waited": [], "events": [], "slack_error": None, "slack_sent": True,
+             "webhook_error": None}
 
     async def fake_send(request_id, target_url, tenant_id, settings=None):
         state["events"].append(("slack", request_id, target_url, tenant_id))
         if state["slack_error"] is not None:
             raise state["slack_error"]
+        return state["slack_sent"]
+
+    async def fake_token(request_id, tenant_id, ttl_seconds):
+        state["events"].append(("token", request_id, tenant_id, ttl_seconds))
+        return "tok_" + request_id
+
+    async def fake_webhook(approval_token, request_details, settings=None):
+        state["events"].append(("webhook", approval_token, request_details))
+        if state["webhook_error"] is not None:
+            raise state["webhook_error"]
         return True
 
-    async def fake_wait(request_id, timeout=300):
+    async def fake_wait(request_id, timeout=300, on_pending=None):
         state["events"].append(("wait", request_id))
         state["waited"].append((request_id, timeout))
+        if on_pending is not None:
+            await on_pending()
         if isinstance(state["value"], Exception):
             raise state["value"]
         return state["value"]
 
     monkeypatch.setattr(proxy.slack_service, "send_approval_message", fake_send)
     monkeypatch.setattr(redis_pubsub, "wait_for_approval", fake_wait)
+    monkeypatch.setattr(redis_pubsub, "create_approval_token", fake_token)
+    monkeypatch.setattr(proxy.notification, "send_generic_webhook", fake_webhook)
     return state
 
 
@@ -399,7 +415,7 @@ def test_high_risk_asks_slack_then_waits_then_forwards(decision, target):
     assert len(downstream.requests) == 1
     request_id, timeout = decision["waited"][0]
     assert timeout == 42
-    assert decision["events"] == [("slack", request_id, target, TENANT), ("wait", request_id)]
+    assert decision["events"] == [("wait", request_id), ("slack", request_id, target, TENANT)]
 
 
 def test_slack_failure_fails_closed(decision):
@@ -410,7 +426,7 @@ def test_slack_failure_fails_closed(decision):
     client, _ = make_client(downstream)
     resp = client.post("/api/v1/proxy/", headers={**AUTH, "X-Target-Url": "https://a.example/refund"})
     assert resp.status_code == 503
-    assert decision["waited"] == []
+    assert [e[0] for e in decision["events"]] == ["wait", "slack"]
     assert downstream.requests == []
 
 
@@ -670,3 +686,130 @@ def test_policy_backend_failure_fails_closed(decision, ee_audit):
     assert resp.status_code == 503
     assert downstream.requests == []
     assert audit.calls == [(TENANT, "https://api.stripe.com/v1/refunds", "POST", 503)]
+
+
+# Headless (generic webhook) approvals
+
+WEBHOOK = {"custom_webhook_url": "https://dash.example/hooks/approvals", "custom_webhook_secret": "whsec_test"}
+
+
+def test_both_channels_notified_after_pending(decision):
+    downstream = Downstream()
+    client, _ = make_client(downstream, hitl_timeout_seconds=42, **WEBHOOK)
+    resp = client.post("/api/v1/proxy/v1/refunds?x=1", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"})
+    assert resp.status_code == 200
+    request_id = decision["waited"][0][0]
+    kinds = [e[0] for e in decision["events"]]
+    assert kinds == ["wait", "slack", "token", "webhook"]
+    _, token, details = decision["events"][3]
+    assert token == "tok_" + request_id
+    assert decision["events"][2] == ("token", request_id, TENANT, 42 + 60)
+    assert details["target_url"] == "https://api.stripe.com/v1/refunds?x=1"
+    assert details["method"] == "POST"
+    assert details["tenant_id"] == TENANT
+    assert isinstance(details["expires_at"], int)
+
+
+def test_webhook_not_called_when_unconfigured(decision):
+    client, _ = make_client(Downstream())
+    client.post("/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"})
+    assert [e[0] for e in decision["events"]] == ["wait", "slack"]
+
+
+def test_one_channel_failing_still_waits_for_the_other(decision):
+    from app.services.slack_service import SlackError
+
+    decision["slack_error"] = SlackError("HTTP 500")
+    downstream = Downstream()
+    client, _ = make_client(downstream, **WEBHOOK)
+    assert client.post("/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"}).status_code == 200
+    assert len(downstream.requests) == 1
+
+
+def test_webhook_only_setup(decision):
+    decision["slack_sent"] = False
+    client, _ = make_client(Downstream(), **WEBHOOK)
+    assert client.post("/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"}).status_code == 200
+
+
+@pytest.mark.parametrize("slack_sent", [True, False])
+def test_all_configured_channels_failing_is_503(decision, slack_sent):
+    from app.services.notification import WebhookError
+    from app.services.slack_service import SlackError
+
+    if slack_sent:
+        decision["slack_error"] = SlackError("HTTP 500")
+    else:
+        decision["slack_sent"] = False
+    decision["webhook_error"] = WebhookError("HTTP 502")
+    downstream = Downstream()
+    client, _ = make_client(downstream, **WEBHOOK)
+    resp = client.post("/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"})
+    assert resp.status_code == 503
+    assert downstream.requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("decision_path, status", [("approve", 201), ("deny", 403)])
+async def test_end_to_end_headless_approval(monkeypatch, decision_path, status):
+    import asyncio
+    import fakeredis
+
+    r = fakeredis.FakeAsyncRedis(server=fakeredis.FakeServer(), decode_responses=True)
+    monkeypatch.setattr(redis_pubsub, "_client", r)
+    tokens = asyncio.Queue()
+
+    async def capture(approval_token, request_details, settings=None):
+        await tokens.put(approval_token)
+        return True
+
+    async def no_slack(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(proxy.notification, "send_generic_webhook", capture)
+    monkeypatch.setattr(proxy.slack_service, "send_approval_message", no_slack)
+    downstream = Downstream(lambda req: httpx.Response(201, json={"id": "re_1"}))
+    app, _ = make_app(downstream, hitl_timeout_seconds=5, **WEBHOOK)
+    app.dependency_overrides[get_current_tenant] = lambda: TENANT
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+        agent = asyncio.ensure_future(client.post(
+            "/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"}, content=b"charge=ch_1",
+        ))
+        token = await asyncio.wait_for(tokens.get(), 3)
+        assert downstream.requests == []
+        click = await client.post(f"/api/v1/callbacks/{decision_path}", json={"approval_token": token})
+        assert click.json() == {"status": "success", "action": "approved" if decision_path == "approve" else "denied"}
+        resp = await asyncio.wait_for(agent, 3)
+        reuse = await client.post("/api/v1/callbacks/approve", json={"approval_token": token})
+    assert resp.status_code == status
+    assert len(downstream.requests) == (1 if decision_path == "approve" else 0)
+    assert reuse.status_code == 404
+    assert [k async for k in r.scan_iter("approval_token:*")] == []
+    await r.aclose()
+
+
+@pytest.mark.anyio
+async def test_instant_auto_approval_is_not_lost(monkeypatch):
+    """A headless backend may approve inside the webhook call itself, before Slack is even tried."""
+    import fakeredis
+
+    r = fakeredis.FakeAsyncRedis(server=fakeredis.FakeServer(), decode_responses=True)
+    monkeypatch.setattr(redis_pubsub, "_client", r)
+
+    async def auto_approve(approval_token, request_details, settings=None):
+        assert await redis_pubsub.publish_decision_by_token(approval_token, "approved", request_details["tenant_id"]) is True
+        return True
+
+    async def no_slack(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(proxy.notification, "send_generic_webhook", auto_approve)
+    monkeypatch.setattr(proxy.slack_service, "send_approval_message", no_slack)
+    downstream = Downstream()
+    app, _ = make_app(downstream, hitl_timeout_seconds=2, **WEBHOOK)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+        resp = await client.post("/api/v1/proxy/v1/refunds", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"})
+    assert resp.status_code == 200
+    assert len(downstream.requests) == 1
+    await r.aclose()

@@ -4,6 +4,7 @@ import inspect
 import ipaddress
 import logging
 import socket
+import time
 import uuid
 from functools import lru_cache
 from typing import Callable, List, Optional, Tuple
@@ -20,7 +21,7 @@ from supabase import AsyncClient
 
 from app.core.config import Settings, get_settings
 from app.core.security import tenant_for_token
-from app.services import redis_pubsub, slack_service
+from app.services import notification, redis_pubsub, slack_service
 from app.services.policy_service import DENY, REQUIRES_APPROVAL, PolicyService, get_policy_service
 from app.services.supabase_client import get_supabase
 from app.services.vault_service import VaultError, VaultService, get_vault_service
@@ -52,6 +53,10 @@ router = APIRouter(prefix=PREFIX, tags=["proxy"])
 
 class BlockedTargetError(Exception):
     pass
+
+
+class ApprovalChannelError(Exception):
+    """Every configured approval channel failed to deliver."""
 
 
 def _is_public(address: str) -> bool:
@@ -244,15 +249,39 @@ async def proxy(
 
     if action == REQUIRES_APPROVAL:
         request_id = str(uuid.uuid4())
+
+        async def notify_approvers() -> None:
+            delivered, failures = 0, []
+            try:
+                delivered += await slack_service.send_approval_message(request_id, str(target), tenant_id, settings=settings)
+            except slack_service.SlackError as exc:
+                failures.append(f"Slack: {exc}")
+            if settings.custom_webhook_url is not None:
+                ttl = settings.hitl_timeout_seconds + 60
+                token = await redis_pubsub.create_approval_token(request_id, tenant_id, ttl)
+                details = {
+                    "target_url": str(target),
+                    "method": method,
+                    "tenant_id": tenant_id,
+                    "expires_at": int(time.time()) + settings.hitl_timeout_seconds,
+                }
+                try:
+                    delivered += await notification.send_generic_webhook(token, details, settings=settings)
+                except notification.WebhookError as exc:
+                    failures.append(f"custom webhook: {exc}")
+            for failure in failures:
+                log.error("Approval notification for %s failed: %s", request_id, failure)
+            if failures and not delivered:
+                # Nobody was asked, so waiting could only end in a timeout.
+                raise ApprovalChannelError("; ".join(failures))
+
         try:
-            await slack_service.send_approval_message(request_id, str(target), tenant_id, settings=settings)
-        except slack_service.SlackError as exc:
-            # Nobody would be asked, so waiting could only end in a timeout.
-            log.error("Slack approval message for %s failed: %s", request_id, exc)
+            decision = await redis_pubsub.wait_for_approval(
+                request_id, settings.hitl_timeout_seconds, on_pending=notify_approvers
+            )
+        except ApprovalChannelError:
             await record_audit(tenant_id, audit_url, method, 503)
             raise HTTPException(503, "approval service unavailable")
-        try:
-            decision = await redis_pubsub.wait_for_approval(request_id, settings.hitl_timeout_seconds)
         except RedisError:
             log.exception("Approval wait failed for %s", request_id)
             await record_audit(tenant_id, audit_url, method, 503)
