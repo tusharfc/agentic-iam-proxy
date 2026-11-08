@@ -1,0 +1,21 @@
+# Slack app manifest for the demo: api.slack.com/apps > Create New App > From a manifest.
+# Replace the request_url host with the URL printed by demo/run_local.sh.
+display_information:
+  name: Agentic IAM Proxy
+  description: Approves high-risk actions requested by AI agents.
+  background_color: "#1f2937"
+features:
+  bot_user:
+    display_name: Agentic IAM Proxy
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - incoming-webhook
+settings:
+  interactivity:
+    is_enabled: true
+    request_url: https://REPLACE-ME.trycloudflare.com/api/v1/callbacks/slack
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
