@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 import regex
@@ -45,21 +46,31 @@ def policy_subject(target_url: str) -> str:
     return f"{parts.scheme.lower()}://{parts.netloc.lower()}{_remove_dot_segments(path)}"
 
 
+@dataclass(frozen=True)
+class PolicyDecision:
+    action: str
+    rule_name: Optional[str] = None
+
+
 class PolicyService:
     def __init__(self, supabase: AsyncClient) -> None:
         self._supabase = supabase
 
     async def evaluate_request(self, tenant_id: str, method: str, target_url: str) -> str:
-        """Returns 'allow', 'deny' or 'requires_approval' for the first matching rule; 'allow' if none match.
+        """Returns 'allow', 'deny' or 'requires_approval' for the first matching rule; 'allow' if none match."""
+        return (await self.match_request(tenant_id, method, target_url)).action
+
+    async def match_request(self, tenant_id: str, method: str, target_url: str) -> PolicyDecision:
+        """Like evaluate_request, plus the name of the deciding rule (shown to approvers).
 
         Fails closed: a broken or runaway pattern on the evaluation path yields 'deny'.
         """
         rules = await self._rules(tenant_id)
         if not rules:
-            return DEFAULT_ACTION
+            return PolicyDecision(DEFAULT_ACTION)
         subject = policy_subject(target_url)
         if len(subject) > MAX_SUBJECT_CHARS:
-            return DENY
+            return PolicyDecision(DENY, "URL too long to evaluate")
         method = method.upper()
         for rule in rules:
             if rule["method"] not in ("*", method):
@@ -69,14 +80,14 @@ class PolicyService:
             except (regex.error, TimeoutError) as exc:
                 log.error("Policy %s (%r) for tenant %s failed to evaluate: %s; denying",
                           rule.get("id"), rule.get("name"), tenant_id, exc)
-                return DENY
+                return PolicyDecision(DENY, rule.get("name"))
             if matched:
                 action = rule["action"]
                 if action not in ACTIONS:
                     log.error("Policy %s for tenant %s has unknown action %r; denying", rule.get("id"), tenant_id, action)
-                    return DENY
-                return action
-        return DEFAULT_ACTION
+                    return PolicyDecision(DENY, rule.get("name"))
+                return PolicyDecision(action, rule.get("name"))
+        return PolicyDecision(DEFAULT_ACTION)
 
     async def _rules(self, tenant_id: str) -> List[Dict[str, Any]]:
         result = await (

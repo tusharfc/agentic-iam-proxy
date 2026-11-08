@@ -96,7 +96,9 @@ def reset_proxy_state(monkeypatch):
 
 
 def make_app(downstream=None, vault=None, policies=None, **settings_overrides):
-    supabase = FakeSupabase({hashlib.sha256(TOKEN.encode()).hexdigest(): [{"tenant_id": TENANT}]})
+    supabase = FakeSupabase({hashlib.sha256(TOKEN.encode()).hexdigest(): [
+        {"tenant_id": TENANT, "name": "billing-bot", "tenants": {"name": "Demo Co"}},
+    ]})
     settings = Settings(_env_file=None, **settings_overrides)
     app = FastAPI()
     app.include_router(proxy.router)
@@ -370,8 +372,9 @@ def decision(monkeypatch):
     state = {"value": "approved", "waited": [], "events": [], "slack_error": None, "slack_sent": True,
              "webhook_error": None}
 
-    async def fake_send(request_id, target_url, tenant_id, settings=None):
-        state["events"].append(("slack", request_id, target_url, tenant_id))
+    async def fake_send(request_id, details, settings=None):
+        state["events"].append(("slack", request_id, details.target_url, details.tenant_id))
+        state["slack_details"] = details
         if state["slack_error"] is not None:
             raise state["slack_error"]
         return state["slack_sent"]
@@ -676,7 +679,7 @@ def test_policy_backend_failure_fails_closed(decision, ee_audit):
     import ee.api.audit as audit
 
     class Broken:
-        async def evaluate_request(self, *args):
+        async def match_request(self, *args):
             raise RuntimeError("supabase down")
 
     downstream = Downstream()
@@ -813,3 +816,37 @@ async def test_instant_auto_approval_is_not_lost(monkeypatch):
     assert resp.status_code == 200
     assert len(downstream.requests) == 1
     await r.aclose()
+
+
+# Approval message details
+
+def test_approval_details_are_human_readable(decision):
+    downstream = Downstream()
+    policies = [rule(r"/v1/refunds", "requires_approval")]
+    policies[0]["name"] = "Refunds need human approval"
+    client, _ = make_client(downstream, policies=policies, hitl_timeout_seconds=120)
+    resp = client.post(
+        "/api/v1/proxy/v1/refunds",
+        headers={**AUTH, "X-Target-Url": "https://api.stripe.com", "Content-Type": "application/x-www-form-urlencoded"},
+        content=b"charge=ch_3UZE&amount=4999",
+    )
+    assert resp.status_code == 200
+    d = decision["slack_details"]
+    assert (d.agent_name, d.tenant_name, d.policy_name, d.service) == ("billing-bot", "Demo Co", "Refunds need human approval", "stripe")
+    assert (d.method, d.endpoint, d.expires_in_seconds) == ("POST", "api.stripe.com/v1/refunds", 120)
+    assert not hasattr(d, "params")
+    assert downstream.requests[0].content == b"charge=ch_3UZE&amount=4999"
+
+
+@pytest.mark.parametrize("policies, path", [
+    ([rule("refunds", "requires_approval")], "/v1/refunds"),
+    ([], "/v1/charges"),
+], ids=["approval", "pass-through"])
+def test_large_bodies_stream_through_unbuffered(decision, policies, path):
+    # A 2 MB body exceeds the 1 MB cap any body-reading code path would apply, so this must stream.
+    downstream = Downstream()
+    client, _ = make_client(downstream, policies=policies)
+    resp = client.post(f"/api/v1/proxy{path}", headers={**AUTH, "X-Target-Url": "https://api.stripe.com"},
+                       content=b"x" * 2_000_000)
+    assert resp.status_code == 200
+    assert len(downstream.requests[0].content) == 2_000_000

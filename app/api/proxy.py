@@ -20,8 +20,9 @@ from starlette.responses import StreamingResponse
 from supabase import AsyncClient
 
 from app.core.config import Settings, get_settings
-from app.core.security import tenant_for_token
+from app.core.security import AgentIdentity, agent_for_token
 from app.services import notification, redis_pubsub, slack_service
+from app.services.approval_details import ApprovalDetails
 from app.services.policy_service import DENY, REQUIRES_APPROVAL, PolicyService, get_policy_service
 from app.services.supabase_client import get_supabase
 from app.services.vault_service import VaultError, VaultService, get_vault_service
@@ -150,15 +151,15 @@ async def record_audit(tenant_id: str, target_url: str, method: str, status_code
         log.exception("Audit log failed for tenant %s", tenant_id)
 
 
-async def _authenticate(request: Request, supabase: AsyncClient) -> str:
+async def _authenticate(request: Request, supabase: AsyncClient) -> AgentIdentity:
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
     token = token.strip()
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": "Bearer"})
-    tenant_id = await tenant_for_token(supabase, "agent_identities", "agent_token", token)
-    if tenant_id is None:
+    identity = await agent_for_token(supabase, token)
+    if identity is None:
         raise HTTPException(401, "invalid agent token", headers={"WWW-Authenticate": "Bearer"})
-    return tenant_id
+    return identity
 
 
 def _target_url(request: Request, path: str) -> httpx.URL:
@@ -207,7 +208,8 @@ async def proxy(
     vault: VaultService = Depends(get_vault_service),
     policies: PolicyService = Depends(get_policy_service),
 ):
-    tenant_id = await _authenticate(request, supabase)
+    identity = await _authenticate(request, supabase)
+    tenant_id = identity.tenant_id
     method = request.method
     try:
         target = _target_url(request, path)
@@ -227,11 +229,12 @@ async def proxy(
         await record_audit(tenant_id, audit_url, method, 400)
         raise HTTPException(400, f"{service_name} credentials are only sent over https")
     try:
-        action = await policies.evaluate_request(tenant_id, method, str(target))
+        decision_rule = await policies.match_request(tenant_id, method, str(target))
     except Exception:
         log.exception("Policy evaluation failed for tenant %s", tenant_id)
         await record_audit(tenant_id, audit_url, method, 503)
         raise HTTPException(503, "policy service unavailable")
+    action = decision_rule.action
     if action == DENY:
         await record_audit(tenant_id, audit_url, method, 403)
         raise HTTPException(403, "Action denied by tenant security policy")
@@ -249,24 +252,37 @@ async def proxy(
 
     if action == REQUIRES_APPROVAL:
         request_id = str(uuid.uuid4())
+        details = ApprovalDetails(
+            method=method,
+            target_url=str(target),
+            tenant_id=tenant_id,
+            service=service_name,
+            tenant_name=identity.tenant_name,
+            agent_name=identity.agent_name,
+            policy_name=decision_rule.rule_name,
+            expires_in_seconds=settings.hitl_timeout_seconds,
+        )
 
         async def notify_approvers() -> None:
             delivered, failures = 0, []
             try:
-                delivered += await slack_service.send_approval_message(request_id, str(target), tenant_id, settings=settings)
+                delivered += await slack_service.send_approval_message(request_id, details, settings=settings)
             except slack_service.SlackError as exc:
                 failures.append(f"Slack: {exc}")
             if settings.custom_webhook_url is not None:
                 ttl = settings.hitl_timeout_seconds + 60
                 token = await redis_pubsub.create_approval_token(request_id, tenant_id, ttl)
-                details = {
+                payload = {
                     "target_url": str(target),
                     "method": method,
                     "tenant_id": tenant_id,
+                    "tenant_name": identity.tenant_name,
+                    "agent_name": identity.agent_name,
+                    "policy_name": decision_rule.rule_name,
                     "expires_at": int(time.time()) + settings.hitl_timeout_seconds,
                 }
                 try:
-                    delivered += await notification.send_generic_webhook(token, details, settings=settings)
+                    delivered += await notification.send_generic_webhook(token, payload, settings=settings)
                 except notification.WebhookError as exc:
                     failures.append(f"custom webhook: {exc}")
             for failure in failures:
