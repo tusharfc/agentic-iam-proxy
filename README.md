@@ -1,10 +1,12 @@
 # Agentic IAM Proxy
-<img width="1446" height="802" alt="image" src="https://github.com/user-attachments/assets/c25e7feb-ab64-4d1c-aa4d-07aae993bcf5" />
-
 
 **Stop giving your AI agents raw API keys.** Agentic IAM Proxy is a local, zero-trust gateway that forces a human-in-the-loop Slack approval before your agent executes high-risk actions.
 
 Your agent gets a revocable proxy token instead of a real API key. Every call goes through the proxy, which checks where it is going, asks a human in Slack before risky actions, and only then attaches the real credential from an encrypted vault. The agent never sees the key.
+
+[![60-second demo: a LangChain agent's Stripe refund pauses until a human clicks Approve in Slack](https://github.com/user-attachments/assets/c25e7feb-ab64-4d1c-aa4d-07aae993bcf5)](https://youtu.be/ZSnzTrGhXpM)
+
+▶️ **[Watch the 60-second demo](https://youtu.be/ZSnzTrGhXpM)**: a LangChain agent's Stripe refund is paused until a human approves it in Slack.
 
 ```mermaid
 sequenceDiagram
