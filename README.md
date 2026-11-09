@@ -1,4 +1,6 @@
 # Agentic IAM Proxy
+<img width="1446" height="802" alt="image" src="https://github.com/user-attachments/assets/c25e7feb-ab64-4d1c-aa4d-07aae993bcf5" />
+
 
 **Stop giving your AI agents raw API keys.** Agentic IAM Proxy is a local, zero-trust gateway that forces a human-in-the-loop Slack approval before your agent executes high-risk actions.
 
