@@ -12,9 +12,12 @@ from langchain_core.callbacks import BaseCallbackHandler
 DEMO_ENV = Path(__file__).with_name(".demo.env")
 if not DEMO_ENV.exists():
     sys.exit("Run demo/setup_demo.py first.")
-for _line in DEMO_ENV.read_text().splitlines():
-    _key, _, _value = _line.partition("=")
-    os.environ.setdefault(_key, _value)
+for _env_file in (DEMO_ENV, Path(__file__).with_name(".keys.env")):
+    if _env_file.exists():
+        for _line in _env_file.read_text().splitlines():
+            _key, _, _value = _line.strip().partition("=")
+            if _key and _value and not _key.startswith("#"):
+                os.environ.setdefault(_key, _value)
 
 AGENTIC_TOKEN = os.environ["AGENTIC_IAM_AGENT_TOKEN"]
 CUSTOMER_ID = os.environ["DEMO_CUSTOMER_ID"]

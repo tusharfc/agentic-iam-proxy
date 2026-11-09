@@ -2,9 +2,10 @@
 and a Stripe test customer with a $49.99 charge for the agent to refund.
 
 Needs .env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, VAULT_ENCRYPTION_KEY) and a Stripe
-*test* key in STRIPE_TEST_KEY. Writes the generated tokens to demo/.demo.env (gitignored).
+*test* key in STRIPE_TEST_KEY (environment or demo/.keys.env). Writes the generated tokens
+to demo/.demo.env (gitignored).
 
-    STRIPE_TEST_KEY=sk_test_... .venv-demo/bin/python demo/setup_demo.py
+    .venv-demo/bin/python demo/setup_demo.py
 """
 from __future__ import annotations
 
@@ -23,6 +24,12 @@ from app.services.vault_service import VaultService  # noqa: E402
 from bootstrap import bootstrap  # noqa: E402
 
 DEMO_ENV = Path(__file__).with_name(".demo.env")
+KEYS_ENV = Path(__file__).with_name(".keys.env")
+if KEYS_ENV.exists():
+    for line in KEYS_ENV.read_text().splitlines():
+        key, _, value = line.strip().partition("=")
+        if key and value and not key.startswith("#"):
+            os.environ.setdefault(key, value)
 REFUND_POLICY = {
     "name": "Refunds need human approval",
     "priority": 10,

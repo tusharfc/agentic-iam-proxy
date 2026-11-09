@@ -153,6 +153,50 @@ curl -X POST localhost:8000/api/v1/callbacks/approve \
 
 The full list, with comments, is in [`.env.example`](.env.example).
 
+## Deploy in Your Own Cloud (BYOC)
+
+There is no hosted Agentic IAM service in the request path. You run the proxy and Redis next to your agents, in your own AWS, GCP or Azure account or on-prem, with `docker compose`, ECS, Kubernetes or a plain VM.
+
+```mermaid
+flowchart LR
+    subgraph Cloud["Your cloud account: AWS, GCP, Azure or on-prem"]
+        Agents["AI agents<br/>LangChain, CrewAI, custom<br/>hold only proxy tokens"]
+        subgraph Stack["Docker: ECS, Kubernetes or a VM"]
+            Proxy["Agentic IAM Proxy<br/>policies, approvals,<br/>key decryption and injection"]
+            Redis[("Redis<br/>paused requests")]
+        end
+        Secret[["VAULT_ENCRYPTION_KEY<br/>your secrets manager"]]
+        LB["HTTPS load balancer<br/>exposes only /api/v1/callbacks/*"]
+    end
+
+    DB[("Supabase<br/>token hashes, policies,<br/>encrypted keys, audit log<br/>Supabase Cloud or self-hosted")]
+    Approvers["Slack or your own<br/>approval dashboard"]
+    APIs["Third-party APIs<br/>Stripe, GitHub, OpenAI"]
+
+    Agents -- "agent token" --> Proxy
+    Proxy <--> Redis
+    Secret -. "env var at startup" .-> Proxy
+    Proxy -- "lookups: ciphertext only" --> DB
+    Proxy -- "approval request" --> Approvers
+    Approvers -- "signed Approve / Deny" --> LB --> Proxy
+    Proxy -- "real key injected, allowlisted hosts only" --> APIs
+```
+
+| What | Where it lives |
+|---|---|
+| Real API keys, decrypted | Only in the proxy's memory, while forwarding a request |
+| `VAULT_ENCRYPTION_KEY` | Your environment or secrets manager. Supabase never sees it, so it can't decrypt your keys |
+| Encrypted keys, token hashes, policies, audit log | Supabase. [Self-host Supabase](https://supabase.com/docs/guides/self-hosting/docker) to keep this inside your network too |
+| Paused requests | Redis, inside your network |
+| Approval message: agent, workspace, method and endpoint | Slack or your webhook. Request bodies and query strings are never sent |
+
+The only outbound connections the proxy makes are to Supabase, your approval channel, the allowlisted APIs and, if you set an Enterprise license key, `api.polar.sh` for license checks.
+
+**Recommended hardening:**
+- Block your agents' direct internet egress, so the proxy is their only route out.
+- Keep port 8000 private, and expose only the Slack callback route publicly.
+- Load `.env` values from your secrets manager instead of a file.
+
 ## Open-Core Disclaimer
 
 - **Core proxy: [GNU AGPLv3](LICENSE).** Everything outside `ee/` and `clients/` (the proxy, vault, Slack approvals, management API) is free and open source. If you modify it and offer it to others over a network, the AGPLv3 requires you to publish your changes.
