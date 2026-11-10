@@ -27,6 +27,8 @@ services:
       retries: 10
 
   proxy:
+    # Pulls the pre-built image (amd64 + arm64); `--build` builds from source instead.
+    image: ghcr.io/tusharfc/agentic-iam-proxy:latest
     build: .
     ports:
       - "127.0.0.1:8000:8000"

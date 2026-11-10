@@ -51,13 +51,13 @@ cd agentic-iam-proxy
 echo "VAULT_ENCRYPTION_KEY=$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')" >> .env
 
 # 3. Start Postgres, Redis and the proxy on http://localhost:8000 (tables are created on first boot)
-docker compose up -d --build --wait
+docker compose up -d --wait
 
 # 4. Create your tenant and admin token (shown once, so save it)
 docker compose exec proxy python bootstrap.py
 ```
 
-No cloud accounts are needed: the database is a local Postgres container (data persists in a Docker volume; `docker compose down -v` wipes it). To use your own Postgres 14+, set `DATABASE_URL` in `docker-compose.yml`.
+Step 3 pulls the pre-built image from `ghcr.io/tusharfc/agentic-iam-proxy` (amd64 and arm64); add `--build` to build from source instead. No cloud accounts are needed: the database is a local Postgres container (data persists in a Docker volume; `docker compose down -v` wipes it). To use your own Postgres 14+, set `DATABASE_URL` in `docker-compose.yml`.
 
 ### Give an agent access to Stripe
 
