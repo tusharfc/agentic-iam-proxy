@@ -1,9 +1,15 @@
 .env
 .env.*
+**/*.env
 .git
+.github
 .venv
+.venv-demo
+.vscode
 .pytest_cache
 **/__pycache__
 tests
+demo
+clients
 supabase
 docs
