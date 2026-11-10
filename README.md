@@ -8,11 +8,21 @@ Your agent gets a revocable proxy token instead of a real API key. Every call go
 https://github.com/user-attachments/assets/d7732997-8a70-4e59-8093-27fc208c8f1d
 
 
+> **Status: V1.** Agentic IAM Proxy is currently in V1. The core AGPL proxy, Slack approval loop, and LangChain/CrewAI wrappers are fully operational. The Commercial Enterprise Edition (planned for Q3 2027: SSO, hash-chained SIEM export, and role-based access control) is currently in development. [Reach out](https://github.com/tusharfc/agentic-iam-proxy/issues/new) for design partner access.
+
+| Works today (open source) | Not in V1 |
+|---|---|
+| Proxy with per-agent tokens, egress allowlist and private-network blocking | SSO / SAML |
+| Encrypted key vault with per-request key injection | Role-based access control |
+| Regex policies: `allow`, `deny`, `requires_approval` | Policy API or dashboard (policies are SQL rows) |
+| Human approval in Slack, or headless via signed webhooks | Persistent or tamper-evident audit store (V1 writes JSON audit lines to stdout) |
+| SDKs: `pip install langchain-agentic-iam` / `crewai-agentic-iam` (Apache-2.0) | Services beyond Stripe, GitHub, OpenAI and Slack |
+
 ```mermaid
 sequenceDiagram
     participant Agent as AI Agent
     participant Proxy as Agentic IAM Proxy
-    participant Vault as Vault (Supabase)
+    participant Vault as Vault (Postgres)
     participant Slack as Human (Slack)
     participant API as Target API (e.g., Stripe)
 
@@ -30,29 +40,24 @@ sequenceDiagram
 
 ## 5-Minute Quickstart
 
-**You need:** Docker, a [Supabase](https://supabase.com) project, the [Supabase CLI](https://supabase.com/docs/guides/cli), and (for approvals) a Slack app, see [Slack setup](#slack-setup).
+**You need:** Docker with Compose v2.24+. Slack is optional; see [Slack setup](#slack-setup) to approve from Slack.
 
 ```bash
 # 1. Clone
 git clone https://github.com/tusharfc/agentic-iam-proxy.git
 cd agentic-iam-proxy
 
-# 2. Configure: fill in SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, VAULT_ENCRYPTION_KEY and the SLACK_* values
-cp .env.example .env
-python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"   # -> VAULT_ENCRYPTION_KEY
+# 2. Generate the key that encrypts stored API keys (keep it safe: losing it makes stored keys unreadable)
+echo "VAULT_ENCRYPTION_KEY=$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')" >> .env
 
-# 3. Create the database tables in your Supabase project
-supabase link --project-ref <your-project-ref>
-supabase db push
+# 3. Start Postgres, Redis and the proxy on http://localhost:8000 (tables are created on first boot)
+docker compose up -d --build --wait
 
-# 4. Start the proxy (http://localhost:8000) and Redis
-docker-compose up -d --build
-
-# 5. Create your tenant and admin token (shown once, so save it)
-docker-compose exec proxy python bootstrap.py
+# 4. Create your tenant and admin token (shown once, so save it)
+docker compose exec proxy python bootstrap.py
 ```
 
-Prefer running the script on your host? `pip install -r requirements.txt && python bootstrap.py` works too.
+No cloud accounts are needed: the database is a local Postgres container (data persists in a Docker volume; `docker compose down -v` wipes it). To use your own Postgres 14+, set `DATABASE_URL` in `docker-compose.yml`.
 
 ### Give an agent access to Stripe
 
@@ -93,11 +98,13 @@ Point your agent framework's HTTP client at `http://localhost:8000/api/v1/proxy/
 5. **Redis Pause.** Requests whose policy is `requires_approval` post an Approve/Deny message to Slack and wait on a Redis channel. The agent's request stays open. A signed Slack callback wakes it. Denied or timed-out requests (`HITL_TIMEOUT_SECONDS`, default 300) get `403` and are never executed.
 6. **Vault Swap.** The agent's token is stripped and the real key is injected as `Authorization: Bearer <key>`. The request is forwarded and the response streams back to the agent.
 
-Decrypted keys are never logged, returned, or written to audit logs.
+Decrypted keys are never logged or returned. Every authenticated request writes one JSON audit line to stdout (tenant, agent, method, URL without its query string, status); follow it with `docker compose logs -f proxy`. V1 has no persistent audit store.
 
 ### Policies
 
 Each row in `tenant_policies` has a `priority` (lowest first), a `method` (`GET`, `POST`, ... or `*`), a `url_pattern` regex, and an `action`: `allow`, `deny` or `requires_approval`. The first matching rule decides. If nothing matches, the request is allowed.
+
+V1 has no policy API, so add rules with SQL, e.g. `docker compose exec postgres psql -U iamproxy iamproxy`:
 
 ```sql
 insert into tenant_policies (tenant_id, name, priority, method, url_pattern, action) values
@@ -149,7 +156,8 @@ curl -X POST localhost:8000/api/v1/callbacks/approve \
 
 | Variable | Purpose |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Database. Use the service-role key (server-side only), not the anon key. |
+| `DATABASE_URL` | Postgres 14+. Docker Compose points it at its bundled Postgres; tables are created on startup. |
+| `POSTGRES_PASSWORD` | Password of the bundled Postgres (default `iamproxy`). Change it for anything beyond local use. |
 | `VAULT_ENCRYPTION_KEY` | Encrypts stored API keys. If you lose it, every stored key becomes unreadable. |
 | `SLACK_WEBHOOK_URL`, `SLACK_SIGNING_SECRET` | Approval messages and signed button callbacks. |
 | `CUSTOM_WEBHOOK_URL`, `CUSTOM_WEBHOOK_SECRET` | Signed headless approval webhooks for your own dashboard (https). |
@@ -159,7 +167,7 @@ The full list, with comments, is in [`.env.example`](.env.example).
 
 ## Deploy in Your Own Cloud (BYOC)
 
-There is no hosted Agentic IAM service in the request path. You run the proxy and Redis next to your agents, in your own AWS, GCP or Azure account or on-prem, with `docker compose`, ECS, Kubernetes or a plain VM.
+There is no hosted Agentic IAM service in the request path. You run the proxy, Redis and Postgres next to your agents, in your own AWS, GCP or Azure account or on-prem, with `docker compose`, ECS, Kubernetes or a plain VM. For production, point `DATABASE_URL` at a managed Postgres such as RDS or Cloud SQL.
 
 ```mermaid
 flowchart LR
@@ -169,11 +177,11 @@ flowchart LR
             Proxy["Agentic IAM Proxy<br/>policies, approvals,<br/>key decryption and injection"]
             Redis[("Redis<br/>paused requests")]
         end
+        DB[("Postgres<br/>token hashes, policies,<br/>encrypted keys")]
         Secret[["VAULT_ENCRYPTION_KEY<br/>your secrets manager"]]
         LB["HTTPS load balancer<br/>exposes only /api/v1/callbacks/*"]
     end
 
-    DB[("Supabase<br/>token hashes, policies,<br/>encrypted keys, audit log<br/>Supabase Cloud or self-hosted")]
     Approvers["Slack or your own<br/>approval dashboard"]
     APIs["Third-party APIs<br/>Stripe, GitHub, OpenAI"]
 
@@ -189,12 +197,13 @@ flowchart LR
 | What | Where it lives |
 |---|---|
 | Real API keys, decrypted | Only in the proxy's memory, while forwarding a request |
-| `VAULT_ENCRYPTION_KEY` | Your environment or secrets manager. Supabase never sees it, so it can't decrypt your keys |
-| Encrypted keys, token hashes, policies, audit log | Supabase. [Self-host Supabase](https://supabase.com/docs/guides/self-hosting/docker) to keep this inside your network too |
+| `VAULT_ENCRYPTION_KEY` | Your environment or secrets manager. Postgres never sees it, so a database dump can't decrypt your keys |
+| Encrypted keys, token hashes, policies | Postgres, inside your network |
 | Paused requests | Redis, inside your network |
+| Audit lines | The proxy's stdout, collected by your log pipeline |
 | Approval message: agent, workspace, method and endpoint | Slack or your webhook. Request bodies and query strings are never sent |
 
-The only outbound connections the proxy makes are to Supabase, your approval channel, the allowlisted APIs and, if you set an Enterprise license key, `api.polar.sh` for license checks.
+The only outbound connections the proxy makes are to your approval channel and the allowlisted APIs.
 
 **Recommended hardening:**
 - Block your agents' direct internet egress, so the proxy is their only route out.
@@ -203,15 +212,15 @@ The only outbound connections the proxy makes are to Supabase, your approval cha
 
 ## Open-Core Disclaimer
 
-- **Core proxy: [GNU AGPLv3](LICENSE).** Everything outside `ee/` and `clients/` (the proxy, vault, Slack approvals, management API) is free and open source. If you modify it and offer it to others over a network, the AGPLv3 requires you to publish your changes.
-- **Enterprise Edition: commercial license.** SSO/SAML and compliance-grade audit logs live in [`ee/`](ee/), are **not** open source, and require an active Enterprise subscription. See [`ee/COMMERCIAL_LICENSE.md`](ee/COMMERCIAL_LICENSE.md).
+- **Core proxy: [GNU AGPLv3](LICENSE).** Everything outside `ee/` and `clients/` (the proxy, vault, approvals, management API) is free and open source. If you modify it and offer it to others over a network, the AGPLv3 requires you to publish your changes.
+- **Enterprise Edition: planned, not released.** SSO, hash-chained SIEM export and role-based access control are in development. No Enterprise code exists yet: [`ee/`](ee/) is reserved for it and holds only its draft [license](ee/COMMERCIAL_LICENSE.md).
 - **Client libraries: [Apache-2.0](clients/python/langchain-agentic-iam/LICENSE).** The SDKs in [`clients/`](clients/) are permissively licensed, so importing them into your agent code places no AGPLv3 obligations on it.
-- **Can't use the AGPLv3?** The core is also available under a commercial license. See [`COMMERCIAL_LICENSE.md`](COMMERCIAL_LICENSE.md).
+- **Can't use the AGPLv3?** A commercial license for the core is planned; see the draft [`COMMERCIAL_LICENSE.md`](COMMERCIAL_LICENSE.md) and [get in touch](https://github.com/tusharfc/agentic-iam-proxy/issues/new).
 
 | Path | License |
 |---|---|
-| everything not listed below | [AGPL-3.0-only](LICENSE) or [commercial](COMMERCIAL_LICENSE.md) |
-| `ee/` | [Proprietary, Enterprise subscription](ee/COMMERCIAL_LICENSE.md) |
+| everything not listed below | [AGPL-3.0-only](LICENSE) |
+| `ee/` | Reserved for the Enterprise Edition; no code yet |
 | `clients/python/langchain-agentic-iam/` | [Apache-2.0](clients/python/langchain-agentic-iam/LICENSE) |
 | `clients/python/crewai-agentic-iam/` | [Apache-2.0](clients/python/crewai-agentic-iam/LICENSE) |
 
@@ -222,6 +231,11 @@ Copyright (c) 2026 Tushar Kumar.
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q
+
+# Also run the schema and queries against real Postgres, in a separate database (its public schema is wiped):
+docker compose up -d --wait postgres
+docker compose exec postgres createdb -U iamproxy iam_test
+TEST_DATABASE_URL=postgresql://iamproxy:iamproxy@127.0.0.1:54320/iam_test .venv/bin/python -m pytest -q tests/test_database.py
 ```
 
-Contributions are welcome under the project's Contributor License Agreement, which keeps dual licensing possible.
+Please open an issue before sending a large pull request. A Contributor License Agreement, which keeps dual licensing possible, will be required once it is published.

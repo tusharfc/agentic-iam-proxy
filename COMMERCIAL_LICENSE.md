@@ -28,7 +28,7 @@ meeting the AGPLv3's obligations:
   network, without releasing your modifications;
 - combine the Software with proprietary code into a single work you distribute
   or offer as a service;
-- use Enterprise Features (Section 4) in production.
+- use Planned Commercial Features (Section 4) in production, once released.
 
 ## 3. Grant
 
@@ -36,7 +36,7 @@ Subject to payment of the applicable fees and compliance with this license,
 Licensor grants the customer named in the Order ("Licensee") a non-exclusive,
 non-transferable, non-sublicensable license, for the Subscription Term, to:
 
-- (a) install and run the Software, including Enterprise Features, on
+- (a) install and run the Software, including any released Commercial Features, on
   infrastructure that Licensee owns or controls (including Licensee's own
   accounts with cloud providers, "BYOC");
 - (b) modify the Software and create derivative works for that use; and
@@ -46,13 +46,14 @@ non-transferable, non-sublicensable license, for the Subscription Term, to:
 in each case solely for Licensee's and its Affiliates' internal business
 purposes and within the usage limits stated in the Order.
 
-## 4. Enterprise Features
+## 4. Planned Commercial Features (Targeting Q3 2027)
 
-"Enterprise Features" means functionality that Licensor designates as
-commercial, including SSO/SAML integration and immutable audit-log retention
-and export, and any source files in directories named `ee/`. Enterprise
-Features are **not** licensed under the AGPLv3. They are available only under
-this Commercial License and require a valid license key.
+"Commercial Features" means functionality that Licensor designates as
+commercial. None has been released yet. Planned, targeting Q3 2027: SSO,
+hash-chained SIEM export and role-based access control. Once released, they
+will live in directories named `ee/`, will **not** be licensed under the
+AGPLv3, and will be available only under this Commercial License with a valid
+license key.
 
 ## 5. Restrictions
 
@@ -62,7 +63,7 @@ Licensee shall not:
   or managed service;
 - (b) sell, resell, rent, lease or sublicense the Software;
 - (c) remove, disable or circumvent license-key checks or feature gating, or
-  use Enterprise Features beyond the purchased tier or limits;
+  use Commercial Features beyond the purchased tier or limits;
 - (d) remove or alter copyright, license or attribution notices.
 
 Code that Licensee receives under the AGPLv3 from third parties remains
@@ -77,7 +78,7 @@ subject to the AGPLv3 with respect to those third parties.
   renews with the subscription.
 - **Termination.** If Licensee does not pay or materially breaches this license
   and does not cure within [30] days of notice, the license terminates. On
-  expiry or termination, Licensee shall within [30] days stop using Enterprise
+  expiry or termination, Licensee shall within [30] days stop using Commercial
   Features and any modifications not made available under the AGPLv3.
   Licensee may continue to use the unmodified Software under the AGPLv3.
 - **Compliance.** On reasonable request, no more than once per year, Licensee

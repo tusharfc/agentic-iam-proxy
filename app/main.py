@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -11,52 +12,46 @@ from app.api.proxy import close_http_client
 from app.api.proxy import router as proxy_router
 from app.api.webhooks import router as webhooks_router
 from app.core.config import get_settings
-from app.core.licensing import LicenseMiddleware, LicenseValidator
+from app.services.database import close_database, get_database
 from app.services.redis_pubsub import close_redis
 
 log = logging.getLogger(__name__)
 
-try:
-    from ee.api import router as ee_router
-except ImportError as exc:
-    ee_router = None
-    # Silent only when ee/ is absent; a broken Enterprise install should be visible.
-    if not (isinstance(exc, ModuleNotFoundError) and exc.name in ("ee", "ee.api")):
-        log.warning("Enterprise Edition failed to import, running Community Edition: %r", exc)
 
-EDITION = "community" if ee_router is None else "enterprise"
+def _configure_logging() -> None:
+    # Uvicorn only configures its own loggers; without a handler, app INFO logs (incl. app.audit) are dropped.
+    app_log = logging.getLogger("app")
+    if not app_log.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        app_log.addHandler(handler)
+        app_log.setLevel(logging.INFO)
 
+
+_configure_logging()
 settings = get_settings()
-license_validator = LicenseValidator(settings)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    lic = await license_validator.current()
-    log.info("License: %s (%s)", lic.tier.name.lower(), lic.reason)
+    if settings.database_url is None:
+        log.error("DATABASE_URL is not set; proxy and management requests will return 503")
+    else:
+        await get_database(settings)
+        log.info("Database ready")
     yield
-    await license_validator.aclose()
     await close_http_client()
     await close_redis()
+    await close_database()
 
 
 app = FastAPI(title="Agentic IAM Proxy", lifespan=lifespan)
-app.add_middleware(
-    LicenseMiddleware,
-    validator=license_validator,
-    enforce=settings.license_enforcement,
-    upgrade_url=settings.upgrade_url,
-)
 app.include_router(webhooks_router)
 app.include_router(proxy_router)
 app.include_router(callbacks_router)
 app.include_router(management_router)
 
-if ee_router is not None:
-    app.include_router(ee_router)
-
 
 @app.get("/health")
 async def health() -> dict:
-    lic = await license_validator.current()
-    return {"status": "ok", "edition": EDITION, "license_tier": lic.tier.name.lower()}
+    return {"status": "ok"}

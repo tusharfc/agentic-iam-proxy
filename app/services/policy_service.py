@@ -8,9 +8,8 @@ from urllib.parse import urlsplit
 
 import regex
 from fastapi import Depends
-from supabase import AsyncClient
 
-from app.services.supabase_client import get_supabase
+from app.services.database import Database, get_database
 
 log = logging.getLogger(__name__)
 
@@ -53,8 +52,8 @@ class PolicyDecision:
 
 
 class PolicyService:
-    def __init__(self, supabase: AsyncClient) -> None:
-        self._supabase = supabase
+    def __init__(self, db: Database) -> None:
+        self._db = db
 
     async def evaluate_request(self, tenant_id: str, method: str, target_url: str) -> str:
         """Returns 'allow', 'deny' or 'requires_approval' for the first matching rule; 'allow' if none match."""
@@ -90,17 +89,10 @@ class PolicyService:
         return PolicyDecision(DEFAULT_ACTION)
 
     async def _rules(self, tenant_id: str) -> List[Dict[str, Any]]:
-        result = await (
-            self._supabase.table("tenant_policies")
-            .select("id, name, priority, method, url_pattern, action")
-            .eq("tenant_id", tenant_id)
-            .order("priority")
-            .execute()
-        )
-        rules = [dict(r, method=str(r["method"]).upper()) for r in result.data or []]
+        rules = [dict(r, method=str(r["method"]).upper()) for r in await self._db.policies(tenant_id)]
         rules.sort(key=lambda r: (r["priority"], _STRICTNESS.get(r["action"], -1), str(r.get("id"))))
         return rules
 
 
-def get_policy_service(supabase: AsyncClient = Depends(get_supabase)) -> PolicyService:
-    return PolicyService(supabase)
+def get_policy_service(db: Database = Depends(get_database)) -> PolicyService:
+    return PolicyService(db)

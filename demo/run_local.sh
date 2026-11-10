@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Starts Redis, the proxy (http://127.0.0.1:8000) and a public tunnel for Slack's button callbacks.
+# Starts Postgres (Docker), Redis, the proxy on the host (http://127.0.0.1:8000) and a public tunnel for
+# Slack's button callbacks. To run the proxy in Docker instead: docker compose up -d, then only the tunnel.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 [[ -f .env ]] || { echo "Missing .env (copy .env.example)"; exit 1; }
+docker compose up -d --wait postgres >/dev/null
 LOG_DIR=$(mktemp -d)
 PIDS=()
 cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; rm -rf "$LOG_DIR"; }
@@ -14,6 +16,7 @@ if ! redis-cli -p 6379 ping >/dev/null 2>&1; then
   PIDS+=($!)
 fi
 
+DATABASE_URL="${DATABASE_URL:-postgresql://iamproxy:iamproxy@127.0.0.1:54320/iamproxy}" \
 REDIS_URL=redis://127.0.0.1:6379/0 .venv-demo/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --log-level warning &
 PIDS+=($!)
 

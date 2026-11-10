@@ -15,6 +15,12 @@ The Enterprise Software is proprietary and is **not** open source. Its source is
 visible in this repository for transparency and evaluation only. Publishing it
 here does not license it under the AGPLv3 or any other open-source license.
 
+## Planned Commercial Features (Targeting Q3 2027)
+
+No Enterprise Software has been released yet; this directory currently holds
+only this license. Planned, targeting Q3 2027: SSO, hash-chained SIEM export and
+role-based access control.
+
 ## 2. License grant
 
 You may use the Enterprise Software only while you (or the organization you act
@@ -35,9 +41,9 @@ You may not, and may not permit others to:
    any modified version of it, to any third party;
 2. offer the Enterprise Software, or functionality derived from it, as a hosted
    or managed service to third parties;
-3. remove, disable, bypass or tamper with the license-key validation, the
-   license middleware (`app/core/licensing.py`) or any other feature gating,
-   or otherwise enable Enterprise features beyond what your subscription covers;
+3. remove, disable, bypass or tamper with license-key validation or any other
+   feature gating, or otherwise enable Enterprise features beyond what your
+   subscription covers;
 4. remove or alter any copyright, license or proprietary notice.
 
 ## 4. Termination

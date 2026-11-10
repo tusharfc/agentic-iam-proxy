@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import secrets
 import sys
 import uuid
@@ -11,17 +12,25 @@ from app.core.config import get_settings
 from app.core.security import hash_token
 
 
-def bootstrap(client, tenant_id: Optional[str], tenant_name: str, token_name: str) -> Tuple[str, str]:
+async def bootstrap(db, tenant_id: Optional[str], tenant_name: str, token_name: str) -> Tuple[str, str]:
     if tenant_id is None:
-        tenant_id = client.table("tenants").insert({"name": tenant_name}).execute().data[0]["id"]
-    elif not client.table("tenants").select("id").eq("id", tenant_id).limit(1).execute().data:
+        tenant_id = await db.create_tenant(tenant_name)
+    elif not await db.tenant_exists(tenant_id):
         raise SystemExit(f"Tenant {tenant_id} does not exist.")
 
     token = secrets.token_urlsafe(32)
-    client.table("management_tokens").insert(
-        {"tenant_id": tenant_id, "token_hash": hash_token(token), "name": token_name}
-    ).execute()
+    await db.create_management_token(tenant_id, hash_token(token), token_name)
     return tenant_id, token
+
+
+async def _run(dsn: str, tenant_id: Optional[str], tenant_name: str, token_name: str) -> Tuple[str, str]:
+    from app.services.database import Database
+
+    db = await Database.connect(dsn)
+    try:
+        return await bootstrap(db, tenant_id, tenant_name, token_name)
+    finally:
+        await db.close()
 
 
 def main(argv=None) -> None:
@@ -32,15 +41,13 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     settings = get_settings()
-    if not (settings.supabase_url and settings.supabase_service_role_key):
-        sys.exit("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set (see .env.example).")
+    if settings.database_url is None:
+        sys.exit("DATABASE_URL must be set (see .env.example).")
 
-    from supabase import create_client
-
-    client = create_client(settings.supabase_url, settings.supabase_service_role_key.get_secret_value())
-    tenant_id, token = bootstrap(
-        client, str(args.tenant_id) if args.tenant_id else None, args.tenant_name, args.token_name
-    )
+    tenant_id, token = asyncio.run(_run(
+        settings.database_url.get_secret_value(),
+        str(args.tenant_id) if args.tenant_id else None, args.tenant_name, args.token_name,
+    ))
 
     bar = "=" * 78
     print(f"\n{bar}\n")

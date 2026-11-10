@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import inspect
 import ipaddress
+import json
 import logging
 import socket
 import time
 import uuid
-from functools import lru_cache
-from typing import Callable, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
 from urllib.parse import quote
 
 import anyio
@@ -17,17 +17,17 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from redis.exceptions import RedisError
 from starlette.background import BackgroundTask
 from starlette.responses import StreamingResponse
-from supabase import AsyncClient
 
 from app.core.config import Settings, get_settings
 from app.core.security import AgentIdentity, agent_for_token
 from app.services import notification, redis_pubsub, slack_service
 from app.services.approval_details import ApprovalDetails
+from app.services.database import Database, get_database
 from app.services.policy_service import DENY, REQUIRES_APPROVAL, PolicyService, get_policy_service
-from app.services.supabase_client import get_supabase
 from app.services.vault_service import VaultError, VaultService, get_vault_service
 
 log = logging.getLogger(__name__)
+audit_log = logging.getLogger("app.audit")
 
 PREFIX = "/api/v1/proxy"
 TARGET_HEADER = "x-target-url"
@@ -127,36 +127,25 @@ async def close_http_client() -> None:
         _http_client = None
 
 
-@lru_cache(maxsize=None)
-def _audit_logger() -> Optional[Callable]:
-    try:
-        from ee.api.audit import log_action
-    except ImportError as exc:
-        if not (isinstance(exc, ModuleNotFoundError) and exc.name in ("ee", "ee.api", "ee.api.audit")):
-            log.warning("ee.api.audit failed to import, audit logging disabled: %r", exc)
-        return None
-    return log_action
+def record_audit(identity: AgentIdentity, target_url: str, method: str, status_code: int) -> None:
+    """One JSON line per proxied request. Never includes headers, bodies or query strings."""
+    audit_log.info(json.dumps({
+        "event": "proxy_request",
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "tenant_id": identity.tenant_id,
+        "agent": identity.agent_name,
+        "method": method,
+        "target_url": target_url,
+        "status": status_code,
+    }))
 
 
-async def record_audit(tenant_id: str, target_url: str, method: str, status_code: int) -> None:
-    log_action = _audit_logger()
-    if log_action is None:
-        log.debug("Community Edition: Audit log skipped.")
-        return
-    try:
-        result = log_action(tenant_id, target_url, method, status_code)
-        if inspect.isawaitable(result):
-            await result
-    except Exception:
-        log.exception("Audit log failed for tenant %s", tenant_id)
-
-
-async def _authenticate(request: Request, supabase: AsyncClient) -> AgentIdentity:
+async def _authenticate(request: Request, db: Database) -> AgentIdentity:
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
     token = token.strip()
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": "Bearer"})
-    identity = await agent_for_token(supabase, token)
+    identity = await agent_for_token(db, token)
     if identity is None:
         raise HTTPException(401, "invalid agent token", headers={"WWW-Authenticate": "Bearer"})
     return identity
@@ -203,18 +192,18 @@ async def proxy(
     path: str,
     request: Request,
     settings: Settings = Depends(get_settings),
-    supabase: AsyncClient = Depends(get_supabase),
+    db: Database = Depends(get_database),
     client: httpx.AsyncClient = Depends(get_http_client),
     vault: VaultService = Depends(get_vault_service),
     policies: PolicyService = Depends(get_policy_service),
 ):
-    identity = await _authenticate(request, supabase)
+    identity = await _authenticate(request, db)
     tenant_id = identity.tenant_id
     method = request.method
     try:
         target = _target_url(request, path)
     except HTTPException as exc:
-        await record_audit(tenant_id, request.headers.get(TARGET_HEADER, "").split("?", 1)[0], method, exc.status_code)
+        record_audit(identity, request.headers.get(TARGET_HEADER, "").split("?", 1)[0], method, exc.status_code)
         raise
     audit_url = str(target.copy_with(query=None))
 
@@ -223,20 +212,20 @@ async def proxy(
 
     service_name = service_for(target)
     if service_name is None:
-        await record_audit(tenant_id, audit_url, method, 403)
+        record_audit(identity, audit_url, method, 403)
         raise HTTPException(403, "Egress denied: Host not in approved service allowlist.")
     if target.scheme != "https":
-        await record_audit(tenant_id, audit_url, method, 400)
+        record_audit(identity, audit_url, method, 400)
         raise HTTPException(400, f"{service_name} credentials are only sent over https")
     try:
         decision_rule = await policies.match_request(tenant_id, method, str(target))
     except Exception:
         log.exception("Policy evaluation failed for tenant %s", tenant_id)
-        await record_audit(tenant_id, audit_url, method, 503)
+        record_audit(identity, audit_url, method, 503)
         raise HTTPException(503, "policy service unavailable")
     action = decision_rule.action
     if action == DENY:
-        await record_audit(tenant_id, audit_url, method, 403)
+        record_audit(identity, audit_url, method, 403)
         raise HTTPException(403, "Action denied by tenant security policy")
     # Before any approval request: never ask a human to approve a call that can't be authenticated.
     try:
@@ -245,7 +234,7 @@ async def proxy(
         log.error("Vault lookup for tenant %s, service %s failed: %s", tenant_id, service_name, exc)
         api_key = None
     if api_key is None:
-        await record_audit(tenant_id, audit_url, method, 500)
+        record_audit(identity, audit_url, method, 500)
         raise HTTPException(500, "Missing downstream credentials for this service.")
     # Bearer suits every service in SERVICE_HOSTS; some APIs (e.g. Anthropic) expect `x-api-key` instead.
     headers.append((b"authorization", f"Bearer {api_key}".encode()))
@@ -296,14 +285,14 @@ async def proxy(
                 request_id, settings.hitl_timeout_seconds, on_pending=notify_approvers
             )
         except ApprovalChannelError:
-            await record_audit(tenant_id, audit_url, method, 503)
+            record_audit(identity, audit_url, method, 503)
             raise HTTPException(503, "approval service unavailable")
         except RedisError:
             log.exception("Approval wait failed for %s", request_id)
-            await record_audit(tenant_id, audit_url, method, 503)
+            record_audit(identity, audit_url, method, 503)
             raise HTTPException(503, "approval service unavailable")
         if decision != redis_pubsub.APPROVED:
-            await record_audit(tenant_id, audit_url, method, 403)
+            record_audit(identity, audit_url, method, 403)
             if decision == redis_pubsub.DENIED:
                 raise HTTPException(403, "Action denied by human overseer")
             raise HTTPException(403, "Approval timed out; action not executed")
@@ -314,19 +303,19 @@ async def proxy(
     try:
         upstream = await client.send(upstream_request, stream=True)
     except BlockedTargetError:
-        await record_audit(tenant_id, audit_url, method, 403)
+        record_audit(identity, audit_url, method, 403)
         raise HTTPException(403, "X-Target-Url resolves to a private or reserved address")
     except httpx.TimeoutException:
-        await record_audit(tenant_id, audit_url, method, 504)
+        record_audit(identity, audit_url, method, 504)
         raise HTTPException(504, "downstream API timed out")
     except httpx.HTTPError as exc:
         log.warning("Proxy request to %s failed: %r", audit_url, exc)
-        await record_audit(tenant_id, audit_url, method, 502)
+        record_audit(identity, audit_url, method, 502)
         raise HTTPException(502, "downstream API request failed")
 
     async def finish() -> None:
         await upstream.aclose()
-        await record_audit(tenant_id, audit_url, method, upstream.status_code)
+        record_audit(identity, audit_url, method, upstream.status_code)
 
     response = StreamingResponse(
         upstream.aiter_raw(), status_code=upstream.status_code, background=BackgroundTask(finish)

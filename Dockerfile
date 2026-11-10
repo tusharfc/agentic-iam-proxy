@@ -11,7 +11,6 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY app ./app
-COPY ee ./ee
 COPY bootstrap.py .
 
 # "proxy" is already a Debian system user, so use a distinct unprivileged account.

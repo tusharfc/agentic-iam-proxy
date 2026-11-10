@@ -8,10 +8,9 @@ from typing import Optional
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends
 from pydantic import SecretStr
-from supabase import AsyncClient
 
 from app.core.config import Settings, get_settings
-from app.services.supabase_client import get_supabase
+from app.services.database import Database, get_database
 
 # Printable ASCII without spaces: anything else could break or inject into an HTTP header.
 _VALID_API_KEY = re.compile(r"[\x21-\x7e]+")
@@ -26,9 +25,9 @@ class VaultConfigError(VaultError):
 
 
 class VaultService:
-    def __init__(self, encryption_key: Optional[SecretStr], supabase: AsyncClient) -> None:
+    def __init__(self, encryption_key: Optional[SecretStr], db: Database) -> None:
         self._encryption_key = encryption_key
-        self._supabase = supabase
+        self._db = db
         self._fernet: Optional[Fernet] = None
 
     def _cipher(self) -> Fernet:
@@ -50,18 +49,11 @@ class VaultService:
 
     async def get_decrypted_key(self, tenant_id: str, service_name: str) -> str | None:
         cipher = self._cipher()
-        result = await (
-            self._supabase.table("tenant_api_keys")
-            .select("encrypted_api_key")
-            .eq("tenant_id", tenant_id)
-            .eq("service_name", service_name)
-            .limit(1)
-            .execute()
-        )
-        if not result.data:
+        ciphertext = await self._db.encrypted_api_key(tenant_id, service_name)
+        if ciphertext is None:
             return None
         try:
-            record = json.loads(cipher.decrypt(result.data[0]["encrypted_api_key"].encode()))
+            record = json.loads(cipher.decrypt(ciphertext.encode()))
             api_key = record["key"]
             bound = record["tenant_id"] == str(uuid.UUID(tenant_id)) and record["service"] == service_name
         except (InvalidToken, ValueError, KeyError, TypeError, AttributeError):
@@ -74,6 +66,6 @@ class VaultService:
 
 
 def get_vault_service(
-    settings: Settings = Depends(get_settings), supabase: AsyncClient = Depends(get_supabase)
+    settings: Settings = Depends(get_settings), db: Database = Depends(get_database)
 ) -> VaultService:
-    return VaultService(settings.vault_encryption_key, supabase)
+    return VaultService(settings.vault_encryption_key, db)

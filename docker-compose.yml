@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: iamproxy
+      # Local default; set POSTGRES_PASSWORD in .env for anything beyond your laptop.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-iamproxy}
+      POSTGRES_DB: iamproxy
+    # Loopback only, for host-side tools such as demo/setup_demo.py.
+    ports:
+      - "127.0.0.1:54320:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iamproxy -d iamproxy"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -12,16 +30,25 @@ services:
     build: .
     ports:
       - "127.0.0.1:8000:8000"
-    env_file: .env
+    # Optional: the proxy boots without it; set VAULT_ENCRYPTION_KEY and SLACK_* here (see .env.example).
+    env_file:
+      - path: .env
+        required: false
     environment:
-      # Values come from .env (see .env.example).
-      SUPABASE_URL: ${SUPABASE_URL:?set SUPABASE_URL in .env}
-      # Service-role key, not the anon key: the proxy needs to bypass RLS for its own lookups.
-      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?set SUPABASE_SERVICE_ROLE_KEY in .env}
-      VAULT_ENCRYPTION_KEY: ${VAULT_ENCRYPTION_KEY:?set VAULT_ENCRYPTION_KEY in .env}
-      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      # The bundled Postgres; the proxy creates its tables on startup.
+      DATABASE_URL: postgresql://iamproxy:${POSTGRES_PASSWORD:-iamproxy}@postgres:5432/iamproxy
       REDIS_URL: redis://redis:6379/0
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     restart: unless-stopped
+
+volumes:
+  pgdata:

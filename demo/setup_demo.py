@@ -1,14 +1,15 @@
 """One-time demo setup: tenant, admin token, agent, vaulted Stripe test key, refund policy,
 and a Stripe test customer with a $49.99 charge for the agent to refund.
 
-Needs .env (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, VAULT_ENCRYPTION_KEY) and a Stripe
-*test* key in STRIPE_TEST_KEY (environment or demo/.keys.env). Writes the generated tokens
-to demo/.demo.env (gitignored).
+Needs VAULT_ENCRYPTION_KEY in .env, the Docker Compose stack running (its Postgres is reachable on
+127.0.0.1:54320; set DATABASE_URL to use another database) and a Stripe *test* key in STRIPE_TEST_KEY
+(environment or demo/.keys.env). Writes the generated tokens to demo/.demo.env (gitignored).
 
     .venv-demo/bin/python demo/setup_demo.py
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import sys
@@ -20,8 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.security import hash_token  # noqa: E402
+from app.services.database import Database  # noqa: E402
 from app.services.vault_service import VaultService  # noqa: E402
 from bootstrap import bootstrap  # noqa: E402
+
+COMPOSE_DATABASE_URL = "postgresql://iamproxy:iamproxy@127.0.0.1:54320/iamproxy"
 
 DEMO_ENV = Path(__file__).with_name(".demo.env")
 KEYS_ENV = Path(__file__).with_name(".keys.env")
@@ -56,22 +60,21 @@ def create_demo_charge(stripe_key: str) -> tuple:
     return customer["id"], payment["latest_charge"]
 
 
-def setup(client, vault: VaultService, stripe_key: str) -> dict:
-    tenant_id, admin_token = bootstrap(client, None, "Demo Co", "demo-admin")
-
+async def setup(db: Database, vault: VaultService, stripe_key: str) -> dict:
+    tenant_id, admin_token = await bootstrap(db, None, "Demo Co", "demo-admin")
     agent_token = secrets.token_urlsafe(32)
-    client.table("agent_identities").insert(
-        {"tenant_id": tenant_id, "name": "billing-bot", "agent_token": hash_token(agent_token)}
-    ).execute()
-
-    client.table("tenant_api_keys").upsert(
-        {"tenant_id": tenant_id, "service_name": "stripe",
-         "encrypted_api_key": vault.encrypt_api_key(tenant_id, "stripe", stripe_key)},
-        on_conflict="tenant_id,service_name",
-    ).execute()
-
-    client.table("tenant_policies").insert({"tenant_id": tenant_id, **REFUND_POLICY}).execute()
+    await db.create_agent(tenant_id, "billing-bot", hash_token(agent_token))
+    await db.store_api_key(tenant_id, "stripe", vault.encrypt_api_key(tenant_id, "stripe", stripe_key))
+    await db.create_policy(tenant_id, **REFUND_POLICY)
     return {"DEMO_TENANT_ID": tenant_id, "DEMO_ADMIN_TOKEN": admin_token, "AGENTIC_IAM_AGENT_TOKEN": agent_token}
+
+
+async def _setup(dsn: str, vault: VaultService, stripe_key: str) -> dict:
+    db = await Database.connect(dsn)
+    try:
+        return await setup(db, vault, stripe_key)
+    finally:
+        await db.close()
 
 
 def main() -> None:
@@ -79,13 +82,11 @@ def main() -> None:
     if not stripe_key.startswith(("sk_test_", "rk_test_")):
         sys.exit("Set STRIPE_TEST_KEY to a Stripe *test-mode* key (sk_test_...). Live keys are refused.")
     settings = get_settings()
-    if not (settings.supabase_url and settings.supabase_service_role_key and settings.vault_encryption_key):
-        sys.exit("Fill SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and VAULT_ENCRYPTION_KEY in .env first.")
+    if settings.vault_encryption_key is None:
+        sys.exit("Set VAULT_ENCRYPTION_KEY in .env first (the proxy must use the same key).")
+    dsn = settings.database_url.get_secret_value() if settings.database_url else COMPOSE_DATABASE_URL
 
-    from supabase import create_client
-
-    client = create_client(settings.supabase_url, settings.supabase_service_role_key.get_secret_value())
-    values = setup(client, VaultService(settings.vault_encryption_key, None), stripe_key)
+    values = asyncio.run(_setup(dsn, VaultService(settings.vault_encryption_key, None), stripe_key))
     customer_id, charge_id = create_demo_charge(stripe_key)
     values.update(DEMO_CUSTOMER_ID=customer_id, DEMO_CHARGE_ID=charge_id)
 

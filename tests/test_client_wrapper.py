@@ -15,11 +15,11 @@ from fastapi import FastAPI
 
 from app.api import proxy
 from app.core.config import Settings, get_settings
+from app.services.database import get_database
 from app.services.policy_service import PolicyService, get_policy_service
-from app.services.supabase_client import get_supabase
 from app.services.vault_service import get_vault_service
 from tests.test_policy_service import FakePolicyTable
-from tests.test_proxy import FakeSupabase, FakeVault, STRIPE_KEY, TENANT, TOKEN
+from tests.test_proxy import FakeAgentDB, FakeVault, STRIPE_KEY, TENANT, TOKEN
 
 _CLIENTS = Path(__file__).resolve().parents[1] / "clients" / "python"
 sys.path.insert(0, str(_CLIENTS / "langchain-agentic-iam"))
@@ -47,11 +47,11 @@ def live_proxy(monkeypatch):
 
     monkeypatch.setattr(proxy.redis_pubsub, "wait_for_approval", approve)
     monkeypatch.setattr(proxy.slack_service, "send_approval_message", no_slack)
-    supabase = FakeSupabase({hashlib.sha256(TOKEN.encode()).hexdigest(): [{"tenant_id": TENANT}]})
+    db = FakeAgentDB({hashlib.sha256(TOKEN.encode()).hexdigest(): {"tenant_id": TENANT}})
     settings = Settings(_env_file=None)
     app = FastAPI()
     app.include_router(proxy.router)
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_database] = lambda: db
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_vault_service] = lambda: FakeVault()
     app.dependency_overrides[get_policy_service] = lambda: PolicyService(FakePolicyTable([]))

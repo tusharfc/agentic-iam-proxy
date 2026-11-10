@@ -15,33 +15,15 @@ def anyio_backend():
 
 
 class FakePolicyTable:
-    """In-memory tenant_policies supporting select().eq().order().execute()."""
+    """Stand-in for Database.policies(): the tenant's rows, ordered by priority."""
 
     def __init__(self, rows) -> None:
         self.rows = rows
         self.queries = []
 
-    def table(self, name):
-        fake, state = self, {"filters": {}}
-
-        class Query:
-            def select(self, cols):
-                return self
-
-            def eq(self, col, value):
-                state["filters"][col] = value
-                return self
-
-            def order(self, col):
-                state["order"] = col
-                return self
-
-            async def execute(self):
-                fake.queries.append((name, dict(state["filters"]), state.get("order")))
-                rows = [r for r in fake.rows if r["tenant_id"] == state["filters"].get("tenant_id")]
-                return type("Resp", (), {"data": sorted(rows, key=lambda r: r[state["order"]])})()
-
-        return Query()
+    async def policies(self, tenant_id):
+        self.queries.append(tenant_id)
+        return sorted((r for r in self.rows if r["tenant_id"] == tenant_id), key=lambda r: r["priority"])
 
 
 def rule(pattern, action, priority=100, method="*", tenant=TENANT, rid=None):
@@ -67,7 +49,7 @@ async def test_no_matching_rule_allows():
 async def test_queries_own_tenant_ordered_by_priority():
     table = FakePolicyTable([])
     await PolicyService(table).evaluate_request(TENANT, "GET", "https://api.stripe.com/")
-    assert table.queries == [("tenant_policies", {"tenant_id": TENANT}, "priority")]
+    assert table.queries == [TENANT]
 
 
 @pytest.mark.anyio

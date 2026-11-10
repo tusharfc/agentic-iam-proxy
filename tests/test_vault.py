@@ -17,60 +17,40 @@ def anyio_backend():
     return "asyncio"
 
 
-class FakeSupabase:
-    """Stores tenant_api_keys rows; supports .table().select().eq().eq().limit().execute()."""
+class FakeKeyStore:
+    """Stand-in for Database.encrypted_api_key()."""
 
     def __init__(self) -> None:
         self.rows = []
         self.queries = []
 
-    def table(self, name):
-        fake, filters = self, {}
-
-        class Query:
-            def select(self, cols):
-                filters["_select"] = cols
-                return self
-
-            def eq(self, col, value):
-                filters[col] = value
-                return self
-
-            def limit(self, n):
-                return self
-
-            async def execute(self):
-                fake.queries.append((name, dict(filters)))
-                rows = [
-                    {"encrypted_api_key": r["encrypted_api_key"]} for r in fake.rows
-                    if r["tenant_id"] == filters.get("tenant_id") and r["service_name"] == filters.get("service_name")
-                ]
-                return type("Resp", (), {"data": rows})()
-
-        return Query()
+    async def encrypted_api_key(self, tenant_id, service_name):
+        self.queries.append((tenant_id, service_name))
+        for r in self.rows:
+            if (r["tenant_id"], r["service_name"]) == (tenant_id, service_name):
+                return r["encrypted_api_key"]
+        return None
 
 
 @pytest.fixture
 def vault():
-    supabase = FakeSupabase()
-    service = VaultService(SecretStr(Fernet.generate_key().decode()), supabase)
+    db = FakeKeyStore()
+    service = VaultService(SecretStr(Fernet.generate_key().decode()), db)
 
     def store(tenant_id, service_name, ciphertext):
-        supabase.rows.append({"tenant_id": tenant_id, "service_name": service_name, "encrypted_api_key": ciphertext})
+        db.rows.append({"tenant_id": tenant_id, "service_name": service_name, "encrypted_api_key": ciphertext})
 
-    return service, supabase, store
+    return service, db, store
 
 
 @pytest.mark.anyio
 async def test_roundtrip(vault):
-    service, supabase, store = vault
+    service, db, store = vault
     ciphertext = service.encrypt_api_key(TENANT, "stripe", API_KEY)
     assert API_KEY not in ciphertext
     store(TENANT, "stripe", ciphertext)
     assert await service.get_decrypted_key(TENANT, "stripe") == API_KEY
-    assert supabase.queries == [(
-        "tenant_api_keys", {"_select": "encrypted_api_key", "tenant_id": TENANT, "service_name": "stripe"},
-    )]
+    assert db.queries == [(TENANT, "stripe")]
 
 
 @pytest.mark.anyio
@@ -125,7 +105,7 @@ def test_header_unsafe_keys_cannot_be_stored(vault, bad_key):
 @pytest.mark.anyio
 @pytest.mark.parametrize("key", [None, SecretStr("too-short"), SecretStr("")])
 async def test_bad_vault_config_raises(key):
-    service = VaultService(key, FakeSupabase())
+    service = VaultService(key, FakeKeyStore())
     with pytest.raises(VaultError) as excinfo:
         await service.get_decrypted_key(TENANT, "stripe")
     assert "VAULT_ENCRYPTION_KEY" in str(excinfo.value)

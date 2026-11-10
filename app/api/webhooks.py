@@ -12,11 +12,10 @@ from typing import List, Mapping, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
-from supabase import AsyncClient
 
 from app.core.config import Settings, get_settings
 from app.models.schemas import PolarSubscription, PolarSubscriptionEvent
-from app.services.supabase_client import get_supabase
+from app.services.database import Database, get_database
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +84,7 @@ async def read_limited_body(request: Request) -> bytes:
 async def polar_webhook(
     request: Request,
     settings: Settings = Depends(get_settings),
-    supabase: AsyncClient = Depends(get_supabase),
+    db: Database = Depends(get_database),
 ) -> dict:
     if settings.polar_webhook_secret is None:
         raise HTTPException(status_code=503, detail="webhook secret not configured")
@@ -117,21 +116,18 @@ async def polar_webhook(
         log.warning("Polar product %s is not mapped to a tier; ignoring", sub.product_id)
         return {"result": "unknown_product"}
 
-    response = await supabase.rpc(
-        "apply_polar_subscription",
-        {
-            "p_event_id": request.headers["webhook-id"],
-            "p_event_type": event_type,
-            "p_tenant_id": tenant_id,
-            "p_subscription_id": sub.id,
-            "p_customer_id": sub.customer_id,
-            "p_product_id": sub.product_id,
-            "p_tier": tier,
-            "p_status": sub.status,
-            "p_current_period_end": sub.current_period_end.isoformat() if sub.current_period_end else None,
-            "p_cancel_at_period_end": sub.cancel_at_period_end,
-            "p_modified_at": (sub.modified_at or sub.created_at).isoformat(),
-        },
-    ).execute()
-    log.info("Polar %s for tenant %s: %s", event_type, tenant_id, response.data)
-    return {"result": response.data}
+    result = await db.apply_polar_subscription(
+        event_id=request.headers["webhook-id"],
+        event_type=event_type,
+        tenant_id=tenant_id,
+        subscription_id=sub.id,
+        customer_id=sub.customer_id,
+        product_id=sub.product_id,
+        tier=tier,
+        status=sub.status,
+        current_period_end=sub.current_period_end,
+        cancel_at_period_end=sub.cancel_at_period_end,
+        modified_at=sub.modified_at or sub.created_at,
+    )
+    log.info("Polar %s for tenant %s: %s", event_type, tenant_id, result)
+    return {"result": result}

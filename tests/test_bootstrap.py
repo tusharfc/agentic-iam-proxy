@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 
@@ -10,90 +11,84 @@ import bootstrap
 EXISTING = "5f0c7c1e-2b55-4c2a-9a59-6d3f4b0f1a11"
 
 
-class FakeClient:
-    """Sync supabase client stand-in: tenants + management_tokens."""
+class FakeDatabase:
+    """Stand-in for the Database methods bootstrap uses."""
 
     def __init__(self) -> None:
         self.tables = {"tenants": [{"id": EXISTING, "name": "Acme"}], "management_tokens": []}
+        self.closed = False
 
-    def table(self, name):
-        fake, state = self, {"filters": {}}
+    async def create_tenant(self, name):
+        self.tables["tenants"].append({"id": str(uuid.uuid4()), "name": name})
+        return self.tables["tenants"][-1]["id"]
 
-        class Query:
-            def insert(self, row):
-                state["insert"] = row
-                return self
+    async def tenant_exists(self, tenant_id):
+        return any(t["id"] == tenant_id for t in self.tables["tenants"])
 
-            def select(self, cols):
-                return self
+    async def create_management_token(self, tenant_id, token_hash, name):
+        self.tables["management_tokens"].append({"tenant_id": tenant_id, "token_hash": token_hash, "name": name})
 
-            def eq(self, col, value):
-                state["filters"][col] = value
-                return self
+    async def close(self):
+        self.closed = True
 
-            def limit(self, n):
-                return self
 
-            def execute(self):
-                rows = fake.tables[name]
-                if "insert" in state:
-                    row = dict(state["insert"])
-                    row.setdefault("id", str(uuid.uuid4()))
-                    rows.append(row)
-                    data = [row]
-                else:
-                    data = [r for r in rows if all(r.get(k) == v for k, v in state["filters"].items())]
-                return type("Resp", (), {"data": data})()
-
-        return Query()
+def run(db, *args):
+    return asyncio.run(bootstrap.bootstrap(db, *args))
 
 
 def test_creates_tenant_and_stores_only_hash():
-    client = FakeClient()
-    tenant_id, token = bootstrap.bootstrap(client, None, "Startup", "admin")
-    assert {"id": tenant_id, "name": "Startup"} in client.tables["tenants"]
-    (row,) = client.tables["management_tokens"]
+    db = FakeDatabase()
+    tenant_id, token = run(db, None, "Startup", "admin")
+    assert {"id": tenant_id, "name": "Startup"} in db.tables["tenants"]
+    (row,) = db.tables["management_tokens"]
     assert row["tenant_id"] == tenant_id
     assert row["token_hash"] == hashlib.sha256(token.encode()).hexdigest()
-    assert token not in str(client.tables)
+    assert token not in str(db.tables)
     assert len(token) >= 43
 
 
 def test_uses_existing_tenant():
-    client = FakeClient()
-    tenant_id, _ = bootstrap.bootstrap(client, EXISTING, "ignored", "ci")
+    db = FakeDatabase()
+    tenant_id, _ = run(db, EXISTING, "ignored", "ci")
     assert tenant_id == EXISTING
-    assert len(client.tables["tenants"]) == 1
-    assert client.tables["management_tokens"][0]["name"] == "ci"
+    assert len(db.tables["tenants"]) == 1
+    assert db.tables["management_tokens"][0]["name"] == "ci"
 
 
 def test_unknown_tenant_aborts_without_token():
-    client = FakeClient()
+    db = FakeDatabase()
     with pytest.raises(SystemExit):
-        bootstrap.bootstrap(client, str(uuid.uuid4()), "x", "admin")
-    assert client.tables["management_tokens"] == []
+        run(db, str(uuid.uuid4()), "x", "admin")
+    assert db.tables["management_tokens"] == []
 
 
 def test_main_prints_token_banner(monkeypatch, capsys):
     from app.core.config import Settings
+    from app.services import database
 
-    client = FakeClient()
+    db = FakeDatabase()
+
+    async def connect(dsn):
+        assert dsn == "postgresql://u:p@db:5432/iam"
+        return db
+
     monkeypatch.setattr(bootstrap, "get_settings", lambda: Settings(
-        _env_file=None, supabase_url="https://x.supabase.co", supabase_service_role_key="service-role"
+        _env_file=None, database_url="postgresql://u:p@db:5432/iam"
     ))
-    monkeypatch.setattr("supabase.create_client", lambda url, key: client)
+    monkeypatch.setattr(database.Database, "connect", staticmethod(connect))
     bootstrap.main([])
     out = capsys.readouterr().out
-    token_hash = client.tables["management_tokens"][0]["token_hash"]
+    token_hash = db.tables["management_tokens"][0]["token_hash"]
     token = out.split("✅ Admin Token Generated: ", 1)[1].split()[0]
     assert hashlib.sha256(token.encode()).hexdigest() == token_hash
     assert "⚠️ SAVE THIS NOW. It will never be shown again and is required to hit the /api/v1/manage endpoints." in out
+    assert db.closed
 
 
-def test_main_requires_supabase_config(monkeypatch):
+def test_main_requires_database_url(monkeypatch):
     from app.core.config import Settings
 
     monkeypatch.setattr(bootstrap, "get_settings", lambda: Settings(_env_file=None))
     with pytest.raises(SystemExit) as excinfo:
         bootstrap.main([])
-    assert "SUPABASE_URL" in str(excinfo.value)
+    assert "DATABASE_URL" in str(excinfo.value)

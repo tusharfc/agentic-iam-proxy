@@ -16,7 +16,7 @@ from app.api.callbacks import router as callbacks_router
 from app.core.config import Settings
 from app.services import notification, redis_pubsub
 from app.services.notification import WebhookError, send_generic_webhook, sign_payload
-from app.services.supabase_client import get_supabase
+from app.services.database import get_database
 
 SECRET = "whsec_dashboard_secret"
 URL = "https://dash.example/hooks/approvals"
@@ -174,37 +174,18 @@ MGMT_A, MGMT_B = "mgmt-token-tenant-a", "mgmt-token-tenant-b"
 
 
 class FakeManagementTokens:
-    """management_tokens lookup: .table().select().eq().limit().execute()."""
+    """Stand-in for Database.tenant_for_management_token_hash()."""
 
     rows = {hashlib.sha256(MGMT_A.encode()).hexdigest(): TENANT_A, hashlib.sha256(MGMT_B.encode()).hexdigest(): TENANT_B}
 
-    def table(self, name):
-        assert name == "management_tokens"
-        filters = {}
-        rows = self.rows
-
-        class Query:
-            def select(self, cols):
-                return self
-
-            def eq(self, col, value):
-                filters[col] = value
-                return self
-
-            def limit(self, n):
-                return self
-
-            async def execute(self):
-                tenant = rows.get(filters.get("token_hash"))
-                return type("Resp", (), {"data": [{"tenant_id": tenant}] if tenant else []})()
-
-        return Query()
+    async def tenant_for_management_token_hash(self, token_hash):
+        return self.rows.get(token_hash)
 
 
 def callbacks_app():
     app = FastAPI()
     app.include_router(callbacks_router)
-    app.dependency_overrides[get_supabase] = lambda: FakeManagementTokens()
+    app.dependency_overrides[get_database] = lambda: FakeManagementTokens()
     return TestClient(app)
 
 
@@ -273,7 +254,7 @@ async def test_cross_tenant_callback_is_404_and_token_survives(fake_redis):
     token = await redis_pubsub.create_approval_token(rid, TENANT_A, 60)
     app = FastAPI()
     app.include_router(callbacks_router)
-    app.dependency_overrides[get_supabase] = lambda: FakeManagementTokens()
+    app.dependency_overrides[get_database] = lambda: FakeManagementTokens()
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
         wrong = await client.post("/api/v1/callbacks/approve", json={"approval_token": token}, headers={"X-Management-Token": MGMT_B})
         right = await client.post("/api/v1/callbacks/deny", json={"approval_token": token}, headers=AUTH_A)

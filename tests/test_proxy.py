@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -16,7 +16,7 @@ from app.api.callbacks import router as callbacks_router
 from app.api.management import get_current_tenant
 from app.core.config import Settings, get_settings
 from app.services import redis_pubsub
-from app.services.supabase_client import get_supabase
+from app.services.database import get_database
 from app.services.policy_service import PolicyService, get_policy_service
 from app.services.vault_service import VaultError, get_vault_service
 from tests.test_policy_service import FakePolicyTable, rule
@@ -42,33 +42,16 @@ class FakeVault:
         return self.keys.get((tenant_id, service_name))
 
 
-class FakeSupabase:
-    """Mimics supabase.table(...).select(...).eq(...).limit(...).execute()."""
+class FakeAgentDB:
+    """Stand-in for Database.agent_for_token_hash()."""
 
-    def __init__(self, rows_by_hash) -> None:
-        self.rows_by_hash = rows_by_hash
+    def __init__(self, agents_by_hash) -> None:
+        self.agents_by_hash = agents_by_hash
         self.lookups = []
 
-    def table(self, name):
-        fake, filters = self, {}
-
-        class Query:
-            def select(self, cols):
-                return self
-
-            def eq(self, col, value):
-                filters[col] = value
-                return self
-
-            def limit(self, n):
-                return self
-
-            async def execute(self):
-                fake.lookups.append((name, dict(filters)))
-                rows = fake.rows_by_hash.get(filters.get("agent_token"), [])
-                return type("Resp", (), {"data": rows})()
-
-        return Query()
+    async def agent_for_token_hash(self, token_hash):
+        self.lookups.append(token_hash)
+        return self.agents_by_hash.get(token_hash)
 
 
 class Downstream:
@@ -86,24 +69,21 @@ class Downstream:
 
 @pytest.fixture(autouse=True)
 def reset_proxy_state(monkeypatch):
-    proxy._audit_logger.cache_clear()
     monkeypatch.setattr(proxy, "_http_client", None)
     # Test-only allowlisted hosts; real ones (api.stripe.com, ...) stay in place.
     for host, service in (("a.example", "acme"), ("api.example.com", "acme"), ("b.example", "beta")):
         monkeypatch.setitem(proxy.SERVICE_HOSTS, host, service)
-    yield
-    proxy._audit_logger.cache_clear()
 
 
 def make_app(downstream=None, vault=None, policies=None, **settings_overrides):
-    supabase = FakeSupabase({hashlib.sha256(TOKEN.encode()).hexdigest(): [
-        {"tenant_id": TENANT, "name": "billing-bot", "tenants": {"name": "Demo Co"}},
-    ]})
+    db = FakeAgentDB({hashlib.sha256(TOKEN.encode()).hexdigest(): {
+        "tenant_id": TENANT, "name": "billing-bot", "tenant_name": "Demo Co",
+    }})
     settings = Settings(_env_file=None, **settings_overrides)
     app = FastAPI()
     app.include_router(proxy.router)
     app.include_router(callbacks_router)
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_database] = lambda: db
     app.dependency_overrides[get_settings] = lambda: settings
     vault = FakeVault() if vault is None else vault
     app.dependency_overrides[get_vault_service] = lambda: vault
@@ -114,22 +94,22 @@ def make_app(downstream=None, vault=None, policies=None, **settings_overrides):
         app.dependency_overrides[proxy.get_http_client] = lambda: httpx.AsyncClient(
             transport=httpx.MockTransport(downstream)
         )
-    return app, supabase
+    return app, db
 
 
 def make_client(downstream=None, vault=None, policies=None, **settings_overrides):
-    app, supabase = make_app(downstream, vault, policies, **settings_overrides)
-    return TestClient(app), supabase
+    app, db = make_app(downstream, vault, policies, **settings_overrides)
+    return TestClient(app), db
 
 
 # Authentication
 
 def test_missing_token_is_401():
-    client, supabase = make_client(Downstream())
+    client, db = make_client(Downstream())
     resp = client.get("/api/v1/proxy/", headers={"X-Target-Url": "https://api.example.com"})
     assert resp.status_code == 401
     assert resp.headers["www-authenticate"] == "Bearer"
-    assert supabase.lookups == []
+    assert db.lookups == []
 
 
 @pytest.mark.parametrize("header", ["Basic abc", "Bearer ", "Bearer", TOKEN])
@@ -147,9 +127,9 @@ def test_unknown_token_is_401():
 
 
 def test_lookup_uses_sha256_of_token():
-    client, supabase = make_client(Downstream())
+    client, db = make_client(Downstream())
     client.get("/api/v1/proxy/", headers={**AUTH, "X-Target-Url": "https://api.example.com"})
-    assert supabase.lookups == [("agent_identities", {"agent_token": hashlib.sha256(TOKEN.encode()).hexdigest()})]
+    assert db.lookups == [hashlib.sha256(TOKEN.encode()).hexdigest()]
 
 
 # Forwarding
@@ -312,36 +292,35 @@ async def test_guard_blocks_local_server_by_default(local_server):
 
 # Audit logging
 
-def test_community_edition_skips_audit(caplog):
-    client, _ = make_client(Downstream())
-    with caplog.at_level(logging.DEBUG, logger="app.api.proxy"):
-        client.get("/api/v1/proxy/", headers={**AUTH, "X-Target-Url": "https://a.example"})
-    assert "Community Edition: Audit log skipped." in caplog.text
-
-
 @pytest.fixture
-def ee_audit(tmp_path, monkeypatch):
-    pkg = tmp_path / "ee" / "api"
-    pkg.mkdir(parents=True)
-    (tmp_path / "ee" / "__init__.py").write_text("")
-    (pkg / "__init__.py").write_text("")
-    (pkg / "audit.py").write_text(
-        "calls = []\n"
-        "async def log_action(tenant_id, target_url, method, status_code):\n"
-        "    calls.append((tenant_id, target_url, method, status_code))\n"
-    )
-    monkeypatch.syspath_prepend(str(tmp_path))
-    # The repo's own ee/ may already be imported; drop it so the fake package is found.
-    for mod in ("ee", "ee.api", "ee.api.audit"):
-        sys.modules.pop(mod, None)
-    yield
-    for mod in ("ee", "ee.api", "ee.api.audit"):
-        sys.modules.pop(mod, None)
+def audit(caplog):
+    """(tenant, url, method, status) of every JSON line written to the app.audit logger."""
+    caplog.set_level(logging.INFO, logger="app.audit")
+
+    class Audit:
+        @property
+        def events(self):
+            return [json.loads(r.getMessage()) for r in caplog.records if r.name == "app.audit"]
+
+        @property
+        def calls(self):
+            return [(e["tenant_id"], e["target_url"], e["method"], e["status"]) for e in self.events]
+
+    return Audit()
 
 
-def test_enterprise_audit_logs_success_and_failure(ee_audit):
-    import ee.api.audit as audit
+def test_audit_line_is_json_with_agent_and_without_query(audit):
+    client, _ = make_client(Downstream(lambda req: httpx.Response(201)))
+    client.post("/api/v1/proxy/v1/charges?customer=cus_1", headers={**AUTH, "X-Target-Url": "https://a.example"})
+    (event,) = audit.events
+    assert {k: v for k, v in event.items() if k != "ts"} == {
+        "event": "proxy_request", "tenant_id": TENANT, "agent": "billing-bot", "method": "POST",
+        "target_url": "https://a.example/v1/charges", "status": 201,
+    }
+    assert event["ts"].endswith("+00:00")
 
+
+def test_audit_logs_success_and_failure(audit):
     client, _ = make_client(Downstream(lambda req: httpx.Response(404)))
     client.delete("/api/v1/proxy/v1/x?secret=1", headers={**AUTH, "X-Target-Url": "https://a.example"})
 
@@ -357,9 +336,7 @@ def test_enterprise_audit_logs_success_and_failure(ee_audit):
     ]
 
 
-def test_unauthenticated_requests_are_not_audited(ee_audit):
-    import ee.api.audit as audit
-
+def test_unauthenticated_requests_are_not_audited(audit):
     client, _ = make_client(Downstream())
     client.get("/api/v1/proxy/", headers={"X-Target-Url": "https://a.example"})
     assert audit.calls == []
@@ -464,9 +441,7 @@ def test_low_risk_does_not_wait(decision):
     assert decision["waited"] == []
 
 
-def test_denied_request_is_audited(decision, ee_audit):
-    import ee.api.audit as audit
-
+def test_denied_request_is_audited(decision, audit):
     decision["value"] = "denied"
     client, _ = make_client(Downstream())
     client.post("/api/v1/proxy/", headers={**AUTH, "X-Target-Url": "https://a.example/refund"})
@@ -583,9 +558,7 @@ def test_hostname_match_is_case_and_trailing_dot_insensitive():
     assert vault.lookups == [(TENANT, "stripe")]
 
 
-def test_unknown_host_is_egress_denied(ee_audit):
-    import ee.api.audit as audit
-
+def test_unknown_host_is_egress_denied(audit):
     downstream = Downstream()
     vault = FakeVault()
     client, _ = make_client(downstream, vault)
@@ -614,9 +587,7 @@ def test_egress_denied_before_asking_slack(decision):
     assert decision["events"] == []
 
 
-def test_decrypted_key_never_logged_or_audited(ee_audit, caplog, capsys):
-    import ee.api.audit as audit
-
+def test_decrypted_key_never_logged_or_audited(audit, caplog, capsys):
     def boom(req):
         raise httpx.ConnectError(f"refused {req.headers}")
 
@@ -675,12 +646,10 @@ def test_encoded_path_cannot_dodge_policy(decision):
     assert downstream.requests == []
 
 
-def test_policy_backend_failure_fails_closed(decision, ee_audit):
-    import ee.api.audit as audit
-
+def test_policy_backend_failure_fails_closed(decision, audit):
     class Broken:
         async def match_request(self, *args):
-            raise RuntimeError("supabase down")
+            raise RuntimeError("database down")
 
     downstream = Downstream()
     app, _ = make_app(downstream)
